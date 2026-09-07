@@ -1,0 +1,71 @@
+[Unit]
+# DHU Backup — the Linux counterpart of com.dhulabs.backup.plist.
+#
+# A SYSTEM unit in /etc/systemd/system, not a user unit (review C3, restated for
+# Linux). A `systemd --user` unit's file lives under the adversary's own home,
+# and the job would run AS the adversary: rewritable, stoppable, killable. A
+# system unit's file is root-owned 0644 in a root-owned directory, and a
+# non-root `systemctl stop dhu-backupd` is refused by polkit while `kill` on the
+# process gets EPERM. That pair is the Linux form of the macOS proof
+# (`launchctl bootout system/…` -> "Operation not permitted").
+#
+# There is no User= key: it runs as root, which is what makes the store
+# unwritable by every agent lane while staying world-READABLE for recovery.
+Description=DHU Backup — append-only mirror of the files agents can delete
+Documentation=file:/opt/dhu-backup/README
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+# An absolute, ROOT-OWNED interpreter, with -E -s -S so no PYTHON* environment
+# variable, user site directory or site.py can inject code. Python still
+# prepends the SCRIPT'S OWN directory to sys.path, which is why /opt/dhu-backup/bin
+# must be root-owned too (review H3). install.sh asserts, before writing this
+# file, that /usr/bin/python3 is root-owned and does not resolve through a
+# user-owned symlink — an agent-owned interpreter is a root shell (review H2).
+ExecStart=/usr/bin/python3 -E -s -S /opt/dhu-backup/bin/dhu-backupd
+Restart=always
+RestartSec=2
+Nice=10
+# One open fd per watched DIRECTORY for the inotify trigger, plus the walk's
+# per-depth directory fds. Belt-and-braces for a host with a tight default.
+LimitNOFILE=65536
+
+# ── hardening ────────────────────────────────────────────────────────────────
+# Every key here narrows what this root process can do TO THE HOST. None of them
+# is load-bearing for the product's own guarantee — that is the kernel refusing
+# an agent write to a root-owned 0755 directory, and it holds with all of these
+# switched off. They exist because a root daemon that reads agent-written trees
+# should be able to do as little else as possible.
+NoNewPrivileges=yes
+# The whole filesystem is read-only to this unit except what ReadWritePaths
+# names. The daemon's only writes are inside its own install root.
+ProtectSystem=strict
+ReadWritePaths=/opt/dhu-backup
+# READ-ONLY, not `yes`. The daemon must READ home directories: that is where the
+# watched project trees live, and ProtectHome=yes would make every watch root
+# under /home vanish into an empty tmpfs — the daemon would come up healthy and
+# protect nothing, which is the exact failure the no-default-watchlist rule
+# exists to prevent. Anything stricter than read-only breaks the product.
+ProtectHome=read-only
+# A private /tmp, so this unit cannot see or be steered by another process's
+# temporary files. IF A WATCH ROOT IS UNDER /tmp, CHANGE THIS TO `PrivateTmp=no`
+# — otherwise the daemon watches its own private empty /tmp, finds nothing
+# there, and reports a refused root. See the Linux section of src/README.md.
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+
+# The log is the same file the macOS LaunchDaemon writes, at the same mode, for
+# the same reason: it is part of the agent-READABLE surface (review H4), so it
+# carries paths and decisions and never content. `append:` rather than `file:`
+# so a restart does not truncate the record of what the previous one did.
+StandardOutput=append:/opt/dhu-backup/var/dhu-backupd.log
+StandardError=append:/opt/dhu-backup/var/dhu-backupd.log
+
+[Install]
+WantedBy=multi-user.target

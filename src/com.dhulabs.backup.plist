@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDAEMON, not a LaunchAgent (review C3). A user LaunchAgent's plist lives
+  in ~/Library/LaunchAgents, which is mode 777 and owned by the adversary, and
+  the job would run AS the adversary — rewritable, bootoutable, killable. The
+  system domain is out of reach: `launchctl bootout system/…` returns
+  "Operation not permitted" for a non-root caller.
+
+  No UserName key: it runs as root, which is what makes the store unwritable by
+  every agent lane while staying world-READABLE for recovery (amendment A1).
+
+  ProgramArguments is an absolute, root-owned interpreter with -E -s -S, so no
+  PYTHON* environment variable, user site directory or site.py can inject code.
+  Python still prepends the SCRIPT'S OWN directory to sys.path, which is why
+  that directory must be root-owned too (review H3).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dhulabs.backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>-E</string>
+        <string>-s</string>
+        <string>-S</string>
+        <string>/Library/DHU/backup/bin/dhu-backupd</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- One open fd per watched DIRECTORY for the kqueue trigger (~500 in this
+         tree). The soft RLIMIT_NOFILE on this machine is already 1,048,576, so
+         this is belt-and-braces for a host with a tighter default. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
+    <key>StandardErrorPath</key>
+    <string>/Library/DHU/backup/var/dhu-backupd.log</string>
+
+    <key>StandardOutPath</key>
+    <string>/Library/DHU/backup/var/dhu-backupd.log</string>
+</dict>
+</plist>

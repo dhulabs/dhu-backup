@@ -1,0 +1,31 @@
+# DHU Backup — EXAMPLE watchlist. This file is never installed.
+#
+# The installed copy lives at /Library/DHU/backup/etc/watchlist.conf and is the
+# ONLY source of watched roots. Write it at install time:
+#
+#     sudo bash src/install.sh --watch repo=/Users/you/Projects/my-repo
+#     sudo bash src/install.sh --watchlist ./my-watchlist.conf
+#
+# There is deliberately no default watchlist. A default would name directories
+# that do not exist on this machine, and the installer would then print OK over
+# a store that protects nothing.
+#
+# Format:  <root-id>  <absolute-path>
+# One entry per line; `#` starts a comment. A single trailing `*` on the LAST
+# component is the only glob permitted. `src/dhu_backup_core.py:parse_watchlist`
+# is the authority on this format; the installer's checks are a stricter subset.
+#
+# The installed file is root-owned (0644) and is never derived from the
+# database, an environment variable, or anything an agent writes. Review C5: a
+# task row's `scratchDir` is authoritative about where a task RAN, not about
+# what root should READ, and a path written by the adversary and read by a root
+# process that copies what it finds is a general exfiltration primitive.
+#
+# $TMPDIR is written as the LITERAL path (review M4). Run `echo $TMPDIR` and
+# paste the result. A glob like /var/folders/*/*/T/agent-task-* would sweep
+# another account's temp directory the day a second account exists — and it is
+# refused anyway, because the glob is not in the last component.
+
+# repo       /Users/you/Projects/my-repo
+# worktrees  /Users/you/Projects/my-repo/.claude/worktrees/*
+# scratch    /var/folders/<xx>/<opaque-hash>/T/agent-task-*

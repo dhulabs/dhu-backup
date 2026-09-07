@@ -1,0 +1,1225 @@
+"""Tests for `src/install.sh` and `src/uninstall.sh`.
+
+Run with:  /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
+
+Both scripts need root to do their real work, so this suite proves what CAN be
+proven unprivileged, and the scripts are factored so that most of what matters
+falls in that category:
+
+  * `bash -n` on both — a syntax error in a sudo script is discovered at the
+    worst possible moment otherwise;
+  * the pure bash functions, SOURCED without running any of the install
+    (`DHU_BACKUP_SOURCE_ONLY=1`): `render_watchlist` and its validator, and
+    `watchlist_decision`, which is the whole flags/preserve/refuse precedence
+    rule extracted so all four of its cases are reachable on a machine that
+    already HAS an installed watchlist;
+  * `--dry-run`, which is checked before the root check and prints the plan
+    without touching anything. The "touches nothing" half is asserted, not
+    reasoned about: `snapshot_dest` is taken around every unprivileged run,
+    including the ones that are expected to refuse.
+
+Nothing here runs an installer or an uninstaller for real, and nothing here
+writes under /Library. The one thing this suite READS from the live machine is
+the install surface `snapshot_dest` describes.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SRC = os.path.join(REPO_ROOT, "src")
+INSTALL = os.path.join(SRC, "install.sh")
+UNINSTALL = os.path.join(SRC, "uninstall.sh")
+BASH = "/bin/bash"
+
+# The suite asserts THIS platform's install surface, because that is the one the
+# scripts default to when they are run here. The other platform's plan is
+# asserted separately through `--dry-run --platform`, which is what that flag is
+# for. Hard-coding the macOS paths made every one of these fail on Linux for a
+# reason that had nothing to do with the behaviour under test.
+IS_LINUX = sys.platform.startswith("linux")
+DEST = "/opt/dhu-backup" if IS_LINUX else "/Library/DHU/backup"
+SERVICE_FILE = ("/etc/systemd/system/dhu-backupd.service" if IS_LINUX
+                else "/Library/LaunchDaemons/com.dhulabs.backup.plist")
+SERVICE_NAME = "dhu-backupd" if IS_LINUX else "com.dhulabs.backup"
+OTHER_PLATFORM = "darwin" if IS_LINUX else "linux"
+OTHER_DEST = "/Library/DHU/backup" if IS_LINUX else "/opt/dhu-backup"
+OTHER_SERVICE_FILE = ("/Library/LaunchDaemons/com.dhulabs.backup.plist" if IS_LINUX
+                      else "/etc/systemd/system/dhu-backupd.service")
+PLIST = SERVICE_FILE
+
+#: `stat` is not portable, and neither is this suite's use of it. BSD takes -f
+#: with %Su/%Sg/%Lp; GNU takes -c with %U/%G/%a.
+STAT_FORMAT = ('stat -c "%U:%G %a %s %Y %n"' if IS_LINUX
+               else 'stat -f "%Su:%Sg %Lp %z %m %N"')
+
+
+def requires_non_root(test):
+    """Skip a test that asserts the scripts REFUSE without root.
+
+    Run as root it does not assert a refusal — it performs a real install or a
+    real uninstall on the machine running the suite. That is exactly what it did
+    the first time this suite was run inside a container (2026-09-02): the
+    "refuses without root" test installed the product and the uninstall one
+    removed it again. A test that becomes a destructive action when the
+    environment changes is a test that must refuse to run there.
+    """
+    return unittest.skipIf(
+        os.geteuid() == 0,
+        "runs as root: this test would perform a REAL install/uninstall, not assert a refusal",
+    )(test)
+
+
+def run_bash(args, env=None):
+    """Run /bin/bash with `args`, returning (returncode, stdout+stderr)."""
+    full_env = dict(os.environ)
+    # Simulate `sudo` by default: the installer has NO default uid and refuses
+    # without $SUDO_UID or --owner-uid. Pass env={"SUDO_UID": None} to test
+    # the no-sudo path itself.
+    full_env["SUDO_UID"] = "501"
+    for key, value in (env or {}).items():
+        if value is None:
+            full_env.pop(key, None)
+        else:
+            full_env[key] = value
+    proc = subprocess.run(
+        [BASH] + args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=full_env,
+        timeout=120,
+    )
+    return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+
+def call_function(script, func, *args):
+    """Source `script` for its functions only, then call one of them.
+
+    `DHU_BACKUP_SOURCE_ONLY=1` makes the script `return` before any line that
+    reads or writes the machine, so this exercises the pure functions and
+    nothing else. The function's own exit status is the shell's.
+    """
+    prog = 'DHU_BACKUP_SOURCE_ONLY=1 . "$1" || exit 99\nshift\n"$@"\n'
+    return run_bash(["-c", prog, "_", script, func] + list(args))
+
+
+def call_snippet(script, snippet, *args):
+    """Source `script` for its functions only, then run `snippet` with $1.. set.
+
+    The same trick as `call_function` with a body instead of a single name, for
+    the uninstall planners: computing the plan takes two calls in one shell
+    (`uninstall_state`, then `print_plan_for`), exactly as the script itself
+    does it. The sourced script's own `set -euo pipefail` is in force here, so
+    the snippet runs under the same shell options the real flow does.
+    """
+    prog = 'DHU_BACKUP_SOURCE_ONLY=1 . "$1" || exit 99\nshift\n' + snippet + "\n"
+    return run_bash(["-c", prog, "_", script] + list(args))
+
+
+def fabricate_install_root(case, subdirs=("bin", "etc", "store", "vault", "var")):
+    """Build a throwaway directory tree shaped like an install root.
+
+    The uninstall plan is a function of which of these five directories exist,
+    so a fabricated root is a complete population for it — no machine anywhere
+    needs to have DHU Backup installed for the plan to be asserted. Registered
+    for cleanup on the test, so a failure mid-assertion still removes it.
+    """
+    base = tempfile.mkdtemp(prefix="dhu-fake-install-root-")
+    case.addCleanup(shutil.rmtree, base, True)
+    for sub in subdirs:
+        os.makedirs(os.path.join(base, sub))
+        with open(os.path.join(base, sub, "placeholder"), "w") as handle:
+            handle.write("fabricated\n")
+    return base
+
+
+def snapshot_dest():
+    """The install surface of the live machine, or None if nothing is installed.
+
+    Used only to prove a dry run changed nothing. It covers exactly what these
+    two scripts write — the top-level names under the install root, every file
+    in `bin/` and `etc/` with its owner, mode, size and mtime, and the plist —
+    and deliberately NOT the contents of `store/`, `vault/` or `var/`: the
+    daemon writes those continuously, so including them would make this a test
+    of whether a file changed on disk during the run rather than of what the
+    script did.
+    """
+    if not os.path.isdir(DEST) and not os.path.exists(PLIST):
+        return None
+    script = (
+        'ls -1 "$1" 2>/dev/null | sort\n'
+        'for d in bin etc; do\n'
+        '  find "$1/$d" -maxdepth 1 2>/dev/null | sort |'
+        '    while IFS= read -r f; do ' + STAT_FORMAT + ' "$f" 2>/dev/null; done\n'
+        'done\n'
+        + STAT_FORMAT + ' "$2" 2>/dev/null || echo "no service file"\n'
+    )
+    rc, out = run_bash(["-c", script, "_", DEST, PLIST])
+    return out
+
+
+class SyntaxTest(unittest.TestCase):
+    def test_install_sh_parses(self):
+        rc, out = run_bash(["-n", INSTALL])
+        self.assertEqual(rc, 0, out)
+
+    def test_uninstall_sh_parses(self):
+        rc, out = run_bash(["-n", UNINSTALL])
+        self.assertEqual(rc, 0, out)
+
+    def test_both_scripts_exist_and_are_not_empty(self):
+        for path in (INSTALL, UNINSTALL):
+            self.assertTrue(os.path.isfile(path), path)
+            self.assertGreater(os.path.getsize(path), 500, path)
+
+    def test_sourcing_runs_no_install_step(self):
+        """Sourcing must reach the guard and stop, printing nothing."""
+        rc, out = call_function(INSTALL, "true")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), "", out)
+
+
+class RenderWatchlistTest(unittest.TestCase):
+    """`render_watchlist` — flags in, the text of etc/watchlist.conf out."""
+
+    def render(self, *specs):
+        return call_function(INSTALL, "render_watchlist", *specs)
+
+    def assert_refused(self, out, rc, must_name):
+        self.assertNotEqual(rc, 0, "expected a refusal, got:\n" + out)
+        self.assertNotEqual(rc, 99, "the script failed to source:\n" + out)
+        self.assertIn(must_name, out)
+        # A refusal must never emit a partial watchlist: no entry lines.
+        for line in out.splitlines():
+            self.assertFalse(
+                re.match(r"^[a-z][a-z0-9-]*\s+/", line),
+                "a refusal emitted a rendered entry: " + line,
+            )
+
+    def test_one_root_renders(self):
+        rc, out = self.render("repo=/Users/someone/Projects/thing")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("repo         /Users/someone/Projects/thing", out)
+
+    def test_several_roots_render_in_order(self):
+        rc, out = self.render("repo=/a/b", "worktrees=/a/b/wt/*", "scratch=/private/tmp/x")
+        self.assertEqual(rc, 0, out)
+        entries = [l for l in out.splitlines() if l and not l.startswith("#")]
+        entries = [l for l in entries if l.strip()]
+        self.assertEqual(
+            entries,
+            ["repo         /a/b", "worktrees    /a/b/wt/*", "scratch      /private/tmp/x"],
+        )
+
+    def test_rendered_text_carries_the_format_header(self):
+        rc, out = self.render("repo=/a/b")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("the ONLY source of watched roots", out)
+        self.assertIn("<root-id>  <absolute-path>", out)
+
+    def test_trailing_glob_on_last_component_is_allowed(self):
+        rc, out = self.render("worktrees=/a/b/*")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("worktrees    /a/b/*", out)
+
+    def test_hyphenated_id_is_allowed(self):
+        rc, out = self.render("dhu-backup=/a/b")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("dhu-backup   /a/b", out)
+
+    def test_no_specs_is_refused(self):
+        rc, out = self.render()
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("no entries to render", out)
+
+    def test_relative_path_is_refused(self):
+        rc, out = self.render("repo=Projects/thing")
+        self.assert_refused(out, rc, "repo=Projects/thing")
+        self.assertIn("not absolute", out)
+
+    def test_uppercase_id_is_refused(self):
+        rc, out = self.render("Repo=/a/b")
+        self.assert_refused(out, rc, "Repo=/a/b")
+        self.assertIn("bad root id", out)
+
+    def test_id_with_a_space_is_refused(self):
+        rc, out = self.render("my repo=/a/b")
+        self.assert_refused(out, rc, "my repo=/a/b")
+        self.assertIn("bad root id", out)
+
+    def test_id_starting_with_a_digit_is_refused(self):
+        rc, out = self.render("2repo=/a/b")
+        self.assert_refused(out, rc, "2repo=/a/b")
+        self.assertIn("bad root id", out)
+
+    def test_id_longer_than_32_is_refused(self):
+        long_id = "a" * 33
+        rc, out = self.render(long_id + "=/a/b")
+        self.assert_refused(out, rc, "longer than 32")
+
+    def test_empty_id_is_refused(self):
+        rc, out = self.render("=/a/b")
+        self.assert_refused(out, rc, "empty root id")
+
+    def test_missing_equals_is_refused(self):
+        rc, out = self.render("repo /a/b")
+        self.assert_refused(out, rc, "repo /a/b")
+        self.assertIn("expected <id>=<absolute-path>", out)
+
+    def test_glob_not_in_the_last_component_is_refused(self):
+        rc, out = self.render("worktrees=/a/*/wt")
+        self.assert_refused(out, rc, "worktrees=/a/*/wt")
+        self.assertIn("LAST component", out)
+
+    def test_star_that_is_not_trailing_is_refused(self):
+        rc, out = self.render("repo=/a/b*c")
+        self.assert_refused(out, rc, "repo=/a/b*c")
+        self.assertIn("must be TRAILING", out)
+
+    def test_two_stars_are_refused(self):
+        rc, out = self.render("repo=/a/b**")
+        self.assert_refused(out, rc, "repo=/a/b**")
+        self.assertIn("at most one", out)
+
+    def test_dot_dot_component_is_refused(self):
+        rc, out = self.render("repo=/a/../etc")
+        self.assert_refused(out, rc, "repo=/a/../etc")
+        self.assertIn("'..'", out)
+
+    def test_duplicate_ids_are_refused(self):
+        rc, out = self.render("repo=/a/b", "repo=/c/d")
+        self.assert_refused(out, rc, "repo=/c/d")
+        self.assertIn("duplicate root id", out)
+
+    def test_one_bad_spec_refuses_the_whole_render(self):
+        """A refusal is whole-file: the good root before it is not emitted."""
+        rc, out = self.render("good=/a/b", "BAD=/c/d")
+        self.assert_refused(out, rc, "BAD=/c/d")
+        self.assertNotIn("good         /a/b", out)
+
+    def test_installer_rules_are_a_subset_of_the_daemon_parser(self):
+        """Anything render_watchlist emits, `parse_watchlist` must accept.
+
+        The daemon's parser stays the authority on the format; this asserts the
+        installer can never hand it a root it would then drop.
+        """
+        import sys
+
+        sys.path.insert(0, SRC)
+        from dhu_backup_core import parse_watchlist  # noqa: E402
+
+        rc, out = self.render("repo=/a/b", "worktrees=/a/b/wt/*", "dhu-backup=/x/y")
+        self.assertEqual(rc, 0, out)
+        entries, refusals = parse_watchlist(out)
+        self.assertEqual(refusals, [])
+        self.assertEqual(
+            entries, [("repo", "/a/b"), ("worktrees", "/a/b/wt/*"), ("dhu-backup", "/x/y")]
+        )
+
+
+class WatchlistDecisionTest(unittest.TestCase):
+    """The precedence rule, all four combinations.
+
+    This function exists precisely so the `refuse` case is testable on a machine
+    that already has an installed watchlist — the case that matters most, since
+    it is the one standing between a stranger's first install and a daemon that
+    reports healthy while protecting nothing.
+    """
+
+    def decide(self, flags, existing):
+        return call_function(INSTALL, "watchlist_decision", flags, existing)
+
+    def test_flags_given_and_one_installed_uses_the_flags(self):
+        rc, out = self.decide("1", "1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), "flags")
+
+    def test_flags_given_and_none_installed_uses_the_flags(self):
+        rc, out = self.decide("1", "0")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), "flags")
+
+    def test_no_flags_and_one_installed_preserves(self):
+        rc, out = self.decide("0", "1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), "preserve")
+
+    def test_no_flags_and_none_installed_refuses(self):
+        rc, out = self.decide("0", "0")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), "refuse")
+
+    def test_non_boolean_arguments_are_refused(self):
+        rc, out = self.decide("2", "0")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("0 or 1", out)
+
+
+class WatchlistEntryCountTest(unittest.TestCase):
+    """A watchlist of nothing but comments protects nothing and must be seen."""
+
+    def count(self, text):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+            fh.write(text)
+            path = fh.name
+        try:
+            rc, out = call_function(INSTALL, "watchlist_entry_count", path)
+            self.assertEqual(rc, 0, out)
+            return int(out.strip())
+        finally:
+            os.unlink(path)
+
+    def test_comments_only_counts_zero(self):
+        self.assertEqual(self.count("# a\n\n#  b\n"), 0)
+
+    def test_entries_are_counted(self):
+        self.assertEqual(self.count("# a\nrepo /a\nwork /b\n"), 2)
+
+    def test_missing_file_counts_zero(self):
+        rc, out = call_function(INSTALL, "watchlist_entry_count", "/nonexistent/nope.conf")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), "0")
+
+
+class InstallDryRunTest(unittest.TestCase):
+    """`--dry-run` is checked before the root check, so it runs unprivileged."""
+
+    def dry(self, *args):
+        return run_bash([INSTALL, "--dry-run"] + list(args))
+
+    def test_dry_run_with_roots_exits_zero_and_prints_the_plan(self):
+        rc, out = self.dry("--watch", "repo=/tmp/x", "--owner-uid", "501")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("== plan ==", out)
+        self.assertIn("DRY RUN", out)
+
+    def test_dry_run_names_the_install_root_and_the_rendered_roots(self):
+        rc, out = self.dry("--watch", "repo=/tmp/x", "--watch", "other=/tmp/y/*")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(DEST, out)
+        self.assertIn(SERVICE_FILE, out)
+        self.assertIn("repo         /tmp/x", out)
+        self.assertIn("other        /tmp/y/*", out)
+
+    def test_dry_run_prints_the_planned_files_with_their_modes(self):
+        rc, out = self.dry("--watch", "repo=/tmp/x")
+        self.assertEqual(rc, 0, out)
+        for mode, dest in (
+            ("0755", DEST + "/bin/dhu-backupd"),
+            ("0644", DEST + "/bin/dhu_backup_core.py"),
+            ("0644", DEST + "/bin/credential_patterns.py"),
+            ("0755", DEST + "/bin/dhu-backup"),
+            ("0644", DEST + "/bin/dhu_backup_announce.py"),
+            ("0755", DEST + "/bin/dhu-backup-mcp"),
+            ("0755", DEST + "/bin/dhu-backup-hook"),
+        ):
+            line = [l for l in out.splitlines() if l.strip().endswith("-> " + dest)]
+            self.assertTrue(line, "no planned file line for " + dest)
+            self.assertTrue(line[0].strip().startswith(mode), line[0])
+
+    def test_every_installed_bin_file_is_syntax_checked_and_asserted(self):
+        """The three lists must not drift apart.
+
+        A file added to INSTALL_FILES but not to the py_compile line ships
+        unchecked, and a SyntaxError under KeepAlive is a silent restart loop.
+        One left out of the post-conditions ships unasserted, which is how a
+        wrong owner or mode gets past the one step that exists to catch it.
+        """
+        with open(os.path.join(SRC, "install.sh")) as handle:
+            text = handle.read()
+        table = re.search(r'INSTALL_FILES="\n(.*?)\n"', text, re.S)
+        self.assertTrue(table, "INSTALL_FILES table not found")
+        destinations = []
+        for line in table.group(1).splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[2].startswith("bin/"):
+                destinations.append(parts[2])
+        self.assertIn("bin/credential_patterns.py", destinations)
+        compile_line = re.search(r"py_compile (.*?)\nrm -rf", text, re.S)
+        self.assertTrue(compile_line, "the py_compile invocation was not found")
+        after = text.split("== post-conditions", 1)
+        self.assertEqual(len(after), 2, "the post-conditions section was not found")
+        postconditions = re.search(r"for f in (.*?); do", after[1], re.S)
+        self.assertTrue(postconditions, "the post-condition loop was not found")
+        for destination in destinations:
+            self.assertIn(destination, compile_line.group(1), destination)
+            self.assertIn(destination, postconditions.group(1), destination)
+
+    def test_dry_run_prints_the_planned_directories_with_their_modes(self):
+        rc, out = self.dry("--watch", "repo=/tmp/x")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("0755  " + DEST + "/store", out)
+        self.assertIn("0700  " + DEST + "/vault", out)
+        self.assertIn("0700  " + DEST + "/var/tmp", out)
+
+    def test_dry_run_reports_the_owner_uid_it_was_given(self):
+        rc, out = self.dry("--watch", "repo=/tmp/x", "--owner-uid", "777")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("owner uid    : 777", out)
+        self.assertIn("owner_uid = 777", out)
+
+    def test_dry_run_changes_nothing_under_the_install_root(self):
+        before = snapshot_dest()
+        rc, out = self.dry("--watch", "repo=/tmp/x", "--owner-uid", "501")
+        self.assertEqual(rc, 0, out)
+        after = snapshot_dest()
+        self.assertEqual(before, after, "the dry run changed " + DEST)
+
+    def test_dry_run_creates_no_install_root(self):
+        """A dry run must not bring the install root into existence.
+
+        This used to skip outright on a machine that already had an install
+        ("this machine has a live install at ..."), which meant it ran on clean
+        hosts and never on the author's. The invariant it is really asserting —
+        a dry run does not CREATE the root — holds on both, and is asserted on
+        both by comparing existence across the run rather than demanding a
+        particular starting state.
+        """
+        existed = os.path.isdir(DEST)
+        rc, out = self.dry("--watch", "repo=/tmp/x")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.path.isdir(DEST), existed,
+                         "the dry run changed whether " + DEST + " exists")
+        if not existed:
+            self.assertFalse(os.path.exists(DEST))
+
+    def test_watchlist_file_is_read_and_rendered(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+            fh.write("# a comment\n\nrepo   /tmp/a\nwork   /tmp/b/*\n")
+            path = fh.name
+        try:
+            rc, out = self.dry("--watchlist", path)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("repo         /tmp/a", out)
+            self.assertIn("work         /tmp/b/*", out)
+        finally:
+            os.unlink(path)
+
+    def test_watchlist_file_and_watch_flags_combine(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+            fh.write("repo /tmp/a\n")
+            path = fh.name
+        try:
+            rc, out = self.dry("--watchlist", path, "--watch", "scratch=/tmp/c")
+            self.assertEqual(rc, 0, out)
+            self.assertIn("repo         /tmp/a", out)
+            self.assertIn("scratch      /tmp/c", out)
+        finally:
+            os.unlink(path)
+
+    def test_watchlist_file_with_a_bad_line_refuses_the_whole_install(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+            fh.write("repo /tmp/a\nBAD /tmp/b\n")
+            path = fh.name
+        try:
+            rc, out = self.dry("--watchlist", path)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("bad root id", out)
+            self.assertIn("BAD", out)
+        finally:
+            os.unlink(path)
+
+    def test_watchlist_file_with_no_roots_is_refused(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+            fh.write("# nothing but a comment\n")
+            path = fh.name
+        try:
+            rc, out = self.dry("--watchlist", path)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("named no roots", out)
+            self.assertIn("Nothing has been changed", out)
+        finally:
+            os.unlink(path)
+
+    def test_missing_watchlist_file_is_refused(self):
+        rc, out = self.dry("--watchlist", "/nonexistent/nope.conf")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no such watchlist file", out)
+
+
+class InstallArgumentTest(unittest.TestCase):
+    """Strict parsing: an unknown flag is a usage error, never ignored."""
+
+    def test_unknown_flag_exits_2_with_usage(self):
+        rc, out = run_bash([INSTALL, "--wat"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("unknown argument: --wat", out)
+        self.assertIn("usage:", out)
+
+    def test_bare_positional_argument_exits_2(self):
+        rc, out = run_bash([INSTALL, "/tmp/x"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("unknown argument", out)
+
+    def test_watch_without_a_value_exits_2(self):
+        rc, out = run_bash([INSTALL, "--watch"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--watch needs", out)
+
+    def test_watchlist_without_a_value_exits_2(self):
+        rc, out = run_bash([INSTALL, "--watchlist"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--watchlist needs", out)
+
+    def test_owner_uid_without_a_value_exits_2(self):
+        rc, out = run_bash([INSTALL, "--owner-uid"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--owner-uid needs", out)
+
+    def test_non_numeric_owner_uid_exits_2(self):
+        rc, out = run_bash([INSTALL, "--dry-run", "--watch", "repo=/tmp/x", "--owner-uid", "abc"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("must be a number", out)
+
+    def test_no_owner_uid_and_no_sudo_uid_is_refused(self):
+        """No default uid: a root shell without sudo has no SUDO_UID, and
+        `${SUDO_UID:-501}` would silently protect the first macOS account."""
+        rc, out = run_bash([INSTALL, "--dry-run", "--watch", "repo=/tmp/x"],
+                           env={"SUDO_UID": None})
+        self.assertEqual(rc, 2)
+        self.assertIn("no $SUDO_UID", out)
+        self.assertIn("--owner-uid", out)
+
+    def test_owner_uid_zero_is_refused(self):
+        """uid 0 would make admission (st_uid == owner_uid) refuse everything."""
+        rc, out = run_bash([INSTALL, "--dry-run", "--watch", "repo=/tmp/x", "--owner-uid", "0"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("protect nothing", out)
+
+    def test_help_exits_0_and_documents_the_flags(self):
+        rc, out = run_bash([INSTALL, "--help"])
+        self.assertEqual(rc, 0, out)
+        for flag in ("--watch", "--watchlist", "--owner-uid", "--dry-run"):
+            self.assertIn(flag, out)
+
+    def test_invalid_root_is_refused_before_the_root_check(self):
+        """A refusal a non-root user can see is a refusal they can act on."""
+        rc, out = run_bash([INSTALL, "--dry-run", "--watch", "repo=relative/path"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not absolute", out)
+        self.assertNotIn("must run as root", out)
+
+    @requires_non_root
+    def test_real_run_without_root_refuses_and_changes_nothing(self):
+        before = snapshot_dest()
+        rc, out = run_bash([INSTALL, "--watch", "repo=/tmp/x"])
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("must run as root", out)
+        self.assertEqual(before, snapshot_dest())
+
+
+#: Compute and print the plan for an install root given as `$1`, exactly the way
+#: the script's own flow does it: gather the presence facts with
+#: `uninstall_state`, measure the three sizes with `dir_size`, hand both to
+#: `print_plan_for`. $2 loaded, $3 service-file present, $4 purge.
+PLAN_SNIPPET = (
+    'state="$(uninstall_state "$1")"\n'
+    'print_plan_for "$1" "$state" "$2" "$3" "$4" \\\n'
+    '  "$(dir_size "$1/store")" "$(dir_size "$1/vault")" "$(dir_size "$1/var")"\n'
+)
+
+#: The `--purge` without `--yes` refusal, for the same root. $2..$4 unused.
+REFUSAL_SNIPPET = (
+    'print_purge_refusal "$1" "$(dir_size "$1/store")" \\\n'
+    '  "$(dir_size "$1/vault")" "$(dir_size "$1/var")"\n'
+)
+
+
+class UninstallWatchRootsTest(unittest.TestCase):
+    """`print_watch_roots_for` — the flags that make an uninstall reversible.
+
+    `etc/watchlist.conf` is the only record of WHICH directories were protected,
+    it lives in `etc/`, and every uninstall removes `etc/` while KEEPING
+    `store/`. Found on the Ubuntu VM (2026-09-07): after an uninstall, a
+    re-install with no `--watch` refuses with "no watch roots" — correct, since
+    there is no default watchlist, but it leaves the operator holding captured
+    history for directories they can no longer name. So the uninstall hands the
+    list back as ready-to-paste flags.
+    """
+
+    def roots_output(self, lines):
+        """Run the printer against a fabricated root whose watchlist is `lines`.
+
+        `None` means: do not create the file at all.
+        """
+        base = tempfile.mkdtemp(prefix="dhu-uninstall-roots-")
+        self.addCleanup(shutil.rmtree, base, True)
+        os.mkdir(os.path.join(base, "etc"))
+        if lines is not None:
+            with open(os.path.join(base, "etc", "watchlist.conf"), "w") as handle:
+                handle.write(lines)
+        rc, out = call_snippet(UNINSTALL, 'print_watch_roots_for "$1"', base)
+        self.assertEqual(rc, 0, out)
+        return out
+
+    def test_it_prints_each_root_as_a_watch_flag(self):
+        out = self.roots_output("# a comment\nrepo       /home/a/proj\nother      /home/a/two\n")
+        self.assertIn("re-create them with:", out)
+        self.assertIn("--watch 'repo=/home/a/proj'", out)
+        self.assertIn("--watch 'other=/home/a/two'", out)
+        self.assertNotIn("# a comment", out)
+
+    def test_a_glob_root_is_quoted_so_pasting_cannot_expand_it(self):
+        """The one glob the watchlist permits is a TRAILING `*`.
+
+        Unquoted, the shell that pastes the line would expand it against the
+        pasting user's cwd, and the re-install would protect something other
+        than what was protected. That is a silent substitution, so the quoting
+        is asserted rather than assumed.
+        """
+        out = self.roots_output("worktrees  /home/a/.claude/worktrees/*\n")
+        self.assertIn("--watch 'worktrees=/home/a/.claude/worktrees/*'", out)
+        self.assertNotIn("--watch worktrees=", out)
+
+    def test_an_absent_watchlist_says_so_rather_than_printing_nothing(self):
+        out = self.roots_output(None)
+        self.assertIn("none recorded", out)
+        self.assertIn("absent", out)
+
+    def test_a_watchlist_with_no_entries_says_so(self):
+        out = self.roots_output("# every line is a comment\n\n")
+        self.assertIn("none recorded", out)
+        self.assertIn("names no roots", out)
+
+    def test_the_plan_carries_the_flags_when_etc_is_present(self):
+        """The printer is wired into the plan, not merely defined."""
+        base = fabricate_install_root(self)
+        with open(os.path.join(base, "etc", "watchlist.conf"), "w") as handle:
+            handle.write("repo  /home/a/proj\n")
+        rc, out = call_snippet(
+            UNINSTALL,
+            'state=$(uninstall_state "$1"); print_plan_for "$1" "$state" 0 0 0 1K 1K 1K',
+            base)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--watch 'repo=/home/a/proj'", out)
+
+
+class UninstallPlanTest(unittest.TestCase):
+    """The uninstall PLAN, driven against a FABRICATED install root.
+
+    These four assertions used to run the real `uninstall.sh --dry-run` and read
+    whatever was in the live install root. On the author's Mac an install exists
+    and the script prints its plan; on a clean machine it correctly takes the
+    "nothing to uninstall" early exit and prints no plan at all, so all four
+    failed on a fresh Ubuntu VM (2026-09-07) for a reason that had nothing to do
+    with the behaviour under test — a claim and its evidence not sharing a
+    population. `uninstall.sh` now computes its plan in functions that take the
+    root as an argument, so the plan can be asserted anywhere, with or without an
+    install. The end-to-end runs the real script still gets are below, and they
+    assert only what is true either way.
+    """
+
+    def plan(self, root, loaded=0, service_file=0, purge=0):
+        rc, out = call_snippet(UNINSTALL, PLAN_SNIPPET, root,
+                               str(loaded), str(service_file), str(purge))
+        self.assertNotEqual(rc, 99, "the script failed to source:\n" + out)
+        self.assertEqual(rc, 0, out)
+        return out
+
+    def test_plan_for_a_full_install_lists_removals_and_keeps(self):
+        root = fabricate_install_root(self)
+        out = self.plan(root, loaded=1, service_file=1)
+        self.assertIn("would REMOVE:", out)
+        self.assertIn(SERVICE_NAME, out)
+        self.assertIn(SERVICE_FILE, out)
+        self.assertIn(root + "/bin", out)
+        self.assertIn(root + "/etc", out)
+        self.assertIn("would KEEP", out)
+        for kept in (root + "/store", root + "/vault", root + "/var"):
+            self.assertIn(kept, out)
+        self.assertIn("sudo rm -rf " + root, out)
+
+    def test_plan_names_the_service_stop_command_only_when_it_is_loaded(self):
+        root = fabricate_install_root(self)
+        stop = ("systemctl disable --now " + SERVICE_NAME + ".service" if IS_LINUX
+                else "launchctl bootout system/" + SERVICE_NAME)
+        self.assertIn(stop, self.plan(root, loaded=1, service_file=1))
+        self.assertNotIn(stop, self.plan(root, loaded=0, service_file=0))
+
+    def test_plan_names_only_the_directories_that_are_present(self):
+        """A half-removed install: bin/ and store/ left, etc/ already gone."""
+        root = fabricate_install_root(self, subdirs=("bin", "store"))
+        out = self.plan(root, loaded=0, service_file=0)
+        self.assertIn(root + "/bin", out)
+        self.assertNotIn(root + "/etc   (dhu-backupd.conf", out)
+        self.assertIn(root + "/vault  (absent)", out)
+        self.assertIn(root + "/var    (absent)", out)
+
+    def test_plan_with_purge_says_it_would_delete_rather_than_keep(self):
+        root = fabricate_install_root(self)
+        out = self.plan(root, loaded=1, service_file=1, purge=1)
+        self.assertIn("would DELETE", out)
+        self.assertIn("NOT recoverable", out)
+        self.assertNotIn("would KEEP", out)
+        for doomed in (root + "/store", root + "/vault", root + "/var"):
+            self.assertIn(doomed, out)
+
+    def test_purge_without_yes_refusal_names_the_data_and_changes_nothing(self):
+        root = fabricate_install_root(self)
+        rc, out = call_snippet(UNINSTALL, REFUSAL_SNIPPET, root, "0", "0", "0")
+        self.assertEqual(rc, 0, out)
+        for named in (root + "/store", root + "/vault", root + "/var"):
+            self.assertIn(named, out)
+        self.assertIn("--purge --yes", out)
+        self.assertIn("Nothing has been changed", out)
+        self.assertTrue(os.path.isdir(root + "/store"), "the refusal deleted data")
+
+    def test_state_reports_each_directory_independently(self):
+        root = fabricate_install_root(self, subdirs=("bin", "var"))
+        rc, out = call_function(UNINSTALL, "uninstall_state", root)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), "bin=1 etc=0 store=0 vault=0 var=1")
+
+    def test_nothing_to_uninstall_is_the_clean_machine_path(self):
+        """The early exit a machine with no install gets. Previously untested.
+
+        It is reachable only when the service is not loaded, the service file is
+        absent AND the root does not exist; any one of those being true flips it
+        back to the plan.
+        """
+        missing = os.path.join(tempfile.mkdtemp(prefix="dhu-clean-"), "no-install")
+        self.addCleanup(shutil.rmtree, os.path.dirname(missing), True)
+
+        rc, _ = call_function(UNINSTALL, "uninstall_nothing_to_do", missing, "0", "0")
+        self.assertEqual(rc, 0, "a clean machine must take the early exit")
+        for loaded, service_file in ((1, 0), (0, 1), (1, 1)):
+            rc, _ = call_function(UNINSTALL, "uninstall_nothing_to_do", missing,
+                                  str(loaded), str(service_file))
+            self.assertNotEqual(rc, 0, "loaded=%s service_file=%s" % (loaded, service_file))
+        rc, _ = call_function(UNINSTALL, "uninstall_nothing_to_do",
+                              fabricate_install_root(self), "0", "0")
+        self.assertNotEqual(rc, 0, "an existing root is not nothing to uninstall")
+
+    def test_nothing_to_uninstall_banner_names_the_absent_things(self):
+        rc, out = call_function(UNINSTALL, "print_nothing_to_uninstall", "/no/such/root")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("nothing to uninstall", out)
+        self.assertIn(SERVICE_NAME, out)
+        self.assertIn(SERVICE_FILE + "   (absent)", out)
+        self.assertIn("/no/such/root   (absent)", out)
+
+
+class UninstallTest(unittest.TestCase):
+    """The real `uninstall.sh`, run end to end.
+
+    Everything asserted here is true whether or not this machine has an install.
+    Anything that depends on one is in `UninstallPlanTest` above.
+    """
+
+    def test_dry_run_exits_zero_and_prints_a_plan_or_says_there_is_nothing(self):
+        """The disjunction is the assertion, deliberately.
+
+        A dry run on a machine WITH an install prints the plan; on a clean one
+        it prints the "nothing to uninstall" report. Both are correct and both
+        exit 0, so asserting either one alone would be asserting this machine's
+        ambient state. Which branch the text belongs to is asserted against a
+        fabricated root in `UninstallPlanTest`; what this proves is that the
+        real script, on whatever machine is running it, exits 0 and says one of
+        the two things rather than falling through silently.
+        """
+        rc, out = run_bash([UNINSTALL, "--dry-run"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn(SERVICE_NAME, out)
+        self.assertIn(DEST, out)
+        planned = "would REMOVE:" in out and "DRY RUN" in out
+        nothing = "nothing to uninstall" in out
+        self.assertTrue(planned != nothing,
+                        "expected exactly one of a plan or 'nothing to "
+                        "uninstall', got:\n" + out)
+        if planned:
+            for kept in (DEST + "/store", DEST + "/vault", DEST + "/var"):
+                self.assertIn(kept, out)
+
+    def test_dry_run_prints_the_two_deregistration_steps(self):
+        rc, out = run_bash([UNINSTALL, "--dry-run"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PostToolUseFailure", out)
+        self.assertIn("claude mcp remove -s user dhu-backup", out)
+        self.assertIn("~/.claude/settings.json", out)
+
+    def test_dry_run_changes_nothing(self):
+        before = snapshot_dest()
+        rc, out = run_bash([UNINSTALL, "--dry-run"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(before, snapshot_dest())
+
+    def test_purge_without_yes_never_deletes_whatever_this_machine_has(self):
+        """Exit 2 with the refusal where there IS data, exit 0 where there is not.
+
+        The refusal is only reachable once the "nothing to uninstall" early exit
+        has been passed, so on a clean machine `--purge` correctly reports that
+        there is nothing rather than refusing to delete nothing. The refusal
+        TEXT is asserted against a fabricated root in `UninstallPlanTest`.
+        """
+        rc, out = run_bash([UNINSTALL, "--purge"])
+        if "nothing to uninstall" in out:
+            self.assertEqual(rc, 0, out)
+        else:
+            self.assertEqual(rc, 2, out)
+            for named in (DEST + "/store", DEST + "/vault", DEST + "/var"):
+                self.assertIn(named, out)
+            self.assertIn("--purge --yes", out)
+            self.assertIn("Nothing has been changed", out)
+
+    def test_purge_without_yes_changes_nothing(self):
+        before = snapshot_dest()
+        run_bash([UNINSTALL, "--purge"])
+        self.assertEqual(before, snapshot_dest())
+
+    def test_purge_dry_run_exits_zero_and_never_says_it_would_keep(self):
+        """`--purge --yes --dry-run` on any machine: exit 0, no "would KEEP".
+
+        With an install it prints the DELETE plan; without one it prints the
+        "nothing to uninstall" report. Neither may ever claim the history would
+        be kept, which is the half of this that holds regardless.
+        """
+        rc, out = run_bash([UNINSTALL, "--purge", "--yes", "--dry-run"])
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("would KEEP", out)
+        if "nothing to uninstall" not in out:
+            self.assertIn("would DELETE", out)
+            self.assertIn("NOT recoverable", out)
+
+    def test_purge_dry_run_changes_nothing(self):
+        before = snapshot_dest()
+        run_bash([UNINSTALL, "--purge", "--yes", "--dry-run"])
+        self.assertEqual(before, snapshot_dest())
+
+    def test_unknown_flag_exits_2_with_usage(self):
+        rc, out = run_bash([UNINSTALL, "--nope"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("unknown argument: --nope", out)
+        self.assertIn("usage:", out)
+
+    def test_help_exits_0(self):
+        rc, out = run_bash([UNINSTALL, "--help"])
+        self.assertEqual(rc, 0, out)
+        for flag in ("--dry-run", "--purge", "--yes"):
+            self.assertIn(flag, out)
+
+    @requires_non_root
+    def test_real_run_without_root_refuses_or_finds_nothing_and_changes_nothing(self):
+        """The root check is reached only when there is something to remove.
+
+        On a clean machine the script exits 0 at "nothing to uninstall" before
+        it ever asks who is running it, which is right: refusing to do nothing
+        for lack of privilege would be a worse answer than saying there is
+        nothing to do. Either way it must not change the machine.
+        """
+        before = snapshot_dest()
+        rc, out = run_bash([UNINSTALL])
+        if "nothing to uninstall" in out:
+            self.assertEqual(rc, 0, out)
+        else:
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn("must run as root", out)
+        self.assertEqual(before, snapshot_dest())
+
+
+class PlatformFlagTest(unittest.TestCase):
+    """`--platform` on both scripts: the OTHER platform's plan, dry-run only.
+
+    It exists so the plan a Linux host would execute can be read and asserted
+    from a Mac, and vice versa. It changes the install root, the service manager
+    and the service file, so a real run under it would install or remove the
+    wrong platform's daemon — which is why it is an ERROR without --dry-run
+    rather than a warning. A flag that is quietly ignored is a flag someone
+    relies on.
+    """
+
+    def test_install_dry_run_for_the_other_platform_names_its_root(self):
+        rc, out = run_bash([INSTALL, "--dry-run", "--platform", OTHER_PLATFORM,
+                            "--owner-uid", "1000", "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn(OTHER_DEST, out)
+        self.assertIn(OTHER_SERVICE_FILE, out)
+        self.assertIn("platform     : " + OTHER_PLATFORM, out)
+
+    def test_install_dry_run_for_linux_names_opt_and_systemctl(self):
+        """Asserted by name, from either platform: this is the Linux plan."""
+        rc, out = run_bash([INSTALL, "--dry-run", "--platform", "linux",
+                            "--owner-uid", "1000", "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("/opt/dhu-backup", out)
+        self.assertIn("/etc/systemd/system/dhu-backupd.service", out)
+        self.assertIn("systemctl", out)
+        self.assertIn("0755  /opt/dhu-backup/store", out)
+        self.assertIn("0700  /opt/dhu-backup/vault", out)
+        self.assertNotIn("launchctl", out)
+
+    def test_install_dry_run_for_darwin_names_library_and_launchctl(self):
+        rc, out = run_bash([INSTALL, "--dry-run", "--platform", "darwin",
+                            "--owner-uid", "501", "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("/Library/DHU/backup", out)
+        self.assertIn("/Library/LaunchDaemons/com.dhulabs.backup.plist", out)
+        self.assertIn("launchctl", out)
+        self.assertNotIn("systemctl", out)
+
+    def test_install_dry_run_says_which_platform_this_machine_is(self):
+        """The override is announced, so a plan is never mistaken for this host."""
+        rc, out = run_bash([INSTALL, "--dry-run", "--platform", OTHER_PLATFORM,
+                            "--owner-uid", "1000", "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--platform override", out)
+
+    def test_install_platform_without_dry_run_exits_2_and_changes_nothing(self):
+        before = snapshot_dest()
+        rc, out = run_bash([INSTALL, "--platform", "linux", "--owner-uid", "1000",
+                            "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("only valid together with --dry-run", out)
+        self.assertIn("Nothing has been changed", out)
+        self.assertEqual(before, snapshot_dest())
+
+    def test_install_rejects_an_unknown_platform(self):
+        rc, out = run_bash([INSTALL, "--dry-run", "--platform", "plan9",
+                            "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("darwin or linux", out)
+
+    def test_uninstall_dry_run_for_linux_names_the_unit_and_opt(self):
+        rc, out = run_bash([UNINSTALL, "--dry-run", "--platform", "linux"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("/opt/dhu-backup", out)
+        self.assertIn("/etc/systemd/system/dhu-backupd.service", out)
+        self.assertIn("dhu-backupd", out)
+
+    def test_uninstall_dry_run_for_darwin_names_the_plist_and_library(self):
+        rc, out = run_bash([UNINSTALL, "--dry-run", "--platform", "darwin"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("/Library/DHU/backup", out)
+        self.assertIn("com.dhulabs.backup", out)
+
+    def test_uninstall_platform_without_dry_run_exits_2_and_changes_nothing(self):
+        before = snapshot_dest()
+        rc, out = run_bash([UNINSTALL, "--platform", "linux"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("only valid together with --dry-run", out)
+        self.assertEqual(before, snapshot_dest())
+
+    def test_uninstall_rejects_an_unknown_platform(self):
+        rc, out = run_bash([UNINSTALL, "--dry-run", "--platform", "plan9"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("darwin or linux", out)
+
+    def test_the_other_platforms_dry_run_changes_nothing_here(self):
+        before = snapshot_dest()
+        run_bash([INSTALL, "--dry-run", "--platform", OTHER_PLATFORM,
+                  "--owner-uid", "1000", "--watch", "repo=/tmp/x"])
+        run_bash([UNINSTALL, "--dry-run", "--platform", OTHER_PLATFORM])
+        self.assertEqual(before, snapshot_dest())
+
+
+class NoServiceFlagTest(unittest.TestCase):
+    """`--no-service` installs the files and registers nothing.
+
+    It exists for a container, where the daemon can be started by hand but there
+    is no service manager to register with. The gate is a fact about the MACHINE
+    — the absence of /run/systemd/system — not a promise from the caller, so on
+    a real booted Linux host the flag refuses. On macOS it refuses outright.
+    """
+
+    def test_it_is_refused_on_macos(self):
+        if IS_LINUX:
+            self.skipTest("macOS-only refusal")
+        rc, out = run_bash([INSTALL, "--no-service", "--owner-uid", "501",
+                            "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("Linux only", out)
+
+    def test_it_is_refused_where_systemd_is_running(self):
+        if not IS_LINUX or not os.path.isdir("/run/systemd/system"):
+            self.skipTest("needs a booted systemd host")
+        rc, out = run_bash([INSTALL, "--no-service", "--owner-uid", "1000",
+                            "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("systemd manager IS running", out)
+
+    def test_it_changes_nothing_when_refused(self):
+        """Only where the flag IS refused — otherwise this is a real install.
+
+        On Linux with no systemd manager (a container) the flag is permitted by
+        design, and running it here as root would install the product rather
+        than assert a refusal. That is the third test in this file to have had
+        that shape; the pattern is now named rather than repeated.
+        """
+        if IS_LINUX and not os.path.isdir("/run/systemd/system"):
+            self.skipTest("--no-service is PERMITTED here; this run would be a real install")
+        before = snapshot_dest()
+        rc, out = run_bash([INSTALL, "--no-service", "--owner-uid", "501",
+                            "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(before, snapshot_dest())
+
+    def test_the_gate_is_the_absence_of_a_running_systemd(self):
+        """Asserted in the source: the check must be on /run/systemd/system.
+
+        A gate on `--dry-run`, on an environment variable, or on anything the
+        caller supplies would let the flag be used on a real host, where an
+        unregistered root process does not survive a reboot and none of the
+        installer's post-conditions describe what is actually running.
+        """
+        with open(INSTALL) as handle:
+            text = handle.read()
+        self.assertIn("/run/systemd/system", text)
+        self.assertRegex(
+            text, r"systemd_is_running\(\)\s*\{\s+\[ -d /run/systemd/system \]")
+
+    def test_a_no_service_install_never_claims_a_running_daemon(self):
+        """The heartbeat wait cannot apply when nothing was started.
+
+        With no service registered there is no process to have written a
+        heartbeat, so the script must say what it did and did not prove rather
+        than skipping the section quietly.
+        """
+        with open(INSTALL) as handle:
+            text = handle.read()
+        self.assertIn("no daemon was started, so there is NO heartbeat", text)
+
+
+class InterpreterCheckTest(unittest.TestCase):
+    """The installer asserts its interpreter before writing a service file."""
+
+    def test_the_plan_reports_a_verdict_on_the_interpreter(self):
+        rc, out = run_bash([INSTALL, "--dry-run", "--watch", "repo=/tmp/x",
+                            "--owner-uid", "501"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("interpreter (review H2", out)
+        self.assertRegex(out, r"\n  (OK|REFUSED) ")
+
+    def test_the_plan_names_the_interpreter_it_checked(self):
+        rc, out = run_bash([INSTALL, "--dry-run", "--watch", "repo=/tmp/x",
+                            "--owner-uid", "501"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("interpreter  : /usr/bin/python3", out)
+
+    def test_the_check_runs_before_anything_is_written(self):
+        """Ordered in the source: the refusal is above the first install(1).
+
+        A service file naming an interpreter an agent can replace cannot be
+        fixed by re-running the installer — the daemon is already loaded.
+        """
+        with open(INSTALL) as handle:
+            text = handle.read()
+        refusal = text.index("refusing to install: $INTERP_REASON")
+        first_write = text.index('install -d -o root -g 0 -m "$_mode"')
+        self.assertLess(refusal, first_write)
+
+    def test_it_uses_the_one_pure_function_rather_than_a_second_copy(self):
+        """One rule, one place. The daemon runs the same function at startup."""
+        with open(INSTALL) as handle:
+            text = handle.read()
+        self.assertIn("dhu_backup_core.interpreter_verdict", text)
+
+
+class ProductNeutralityTest(unittest.TestCase):
+    """`src/` must carry nothing from the machine it was written on.
+
+    Every path this project ships is either a fixed install root, a documented
+    placeholder, or a value the operator supplies at install time. A real home
+    directory in the source is how a personal path becomes a default that a
+    stranger then inherits, so it is asserted against rather than reviewed for.
+
+    The two placeholders are `/Users/you` and `/home/you`. `/Users/fixture` is
+    reserved for the test fixtures in the sibling suites and is not accepted
+    here, because nothing under `src/` needs a fabricated home at all.
+    """
+
+    #: A home-directory path naming anyone. The placeholders are the only
+    #: accepted spellings, and `/Users` / `/home` with no name after them (a
+    #: prose mention of the directory itself) is not a match.
+    HOME_PATH = re.compile(r"/(?:Users|home)/(?!you\b)[A-Za-z0-9][A-Za-z0-9._-]*")
+
+    def src_files(self):
+        for dirpath, dirnames, filenames in os.walk(SRC):
+            dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+            for name in sorted(filenames):
+                yield os.path.join(dirpath, name)
+
+    def test_no_real_home_directory_appears_anywhere_in_src(self):
+        offenders = []
+        for path in self.src_files():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    lines = fh.readlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            rel = os.path.relpath(path, REPO_ROOT)
+            for n, line in enumerate(lines, 1):
+                if self.HOME_PATH.search(line):
+                    offenders.append("%s:%d: %s" % (rel, n, line.rstrip()))
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def test_the_placeholder_home_is_actually_used(self):
+        """A regex nothing exercises is a regex that could be wrong.
+
+        `src/README.md` shows the install command with a watch root, so the
+        placeholder has to appear somewhere in `src/` for the rule above to be
+        doing any work at all.
+        """
+        found = False
+        for path in self.src_files():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except (UnicodeDecodeError, OSError):
+                continue
+            if "/Users/you" in text or "/home/you" in text:
+                found = True
+                break
+        self.assertTrue(found, "no placeholder home directory in src/")
+
+    def test_the_rule_catches_a_real_home_directory(self):
+        """The assertion is only worth what its regex catches."""
+        for bad in ["/Users/alice/Projects/x", "/home/bob/proj", "~/x /home/carol/y"]:
+            self.assertIsNotNone(self.HOME_PATH.search(bad), bad)
+        for ok in ["/Users/you/Projects/x", "/home/you/proj", "/Library/DHU/backup"]:
+            self.assertIsNone(self.HOME_PATH.search(ok), ok)
+
+
+class ExampleWatchlistTest(unittest.TestCase):
+    def test_the_personal_watchlist_is_gone(self):
+        self.assertFalse(os.path.exists(os.path.join(SRC, "watchlist.conf")))
+
+    def test_the_example_exists(self):
+        self.assertTrue(os.path.isfile(os.path.join(SRC, "watchlist.conf.example")))
+
+    def test_every_example_root_is_commented_out(self):
+        """An uncommented example line would become a real watch root."""
+        with open(os.path.join(SRC, "watchlist.conf.example")) as fh:
+            for n, line in enumerate(fh, 1):
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    self.fail("line %d is not a comment: %s" % (n, stripped))
+
+    def test_the_example_shows_the_three_shapes(self):
+        with open(os.path.join(SRC, "watchlist.conf.example")) as fh:
+            text = fh.read()
+        self.assertIn("# repo ", text)
+        self.assertIn("# worktrees ", text)
+        self.assertIn("# scratch ", text)
+        self.assertIn("$TMPDIR", text)
+
+    def test_the_installer_does_not_install_the_example(self):
+        with open(INSTALL) as fh:
+            text = fh.read()
+        self.assertNotIn("watchlist.conf.example\"", text)
+        self.assertNotIn("$SRC/watchlist.conf", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

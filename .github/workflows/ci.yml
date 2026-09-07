@@ -1,0 +1,44 @@
+name: ci
+
+# The suite must pass on a CLEAN machine, with nothing from a developer's own.
+# That is not hygiene here: this project has already shipped a suite whose
+# fixtures lived under a hard-coded scratch directory that existed on exactly
+# one machine, where 80 tests ran and everywhere else they silently skipped
+# while the run still printed OK. A clean runner is the standing proof that the
+# claim and its evidence share a population.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The system python3, deliberately, and never a setup-python one: the
+      # daemon runs under /usr/bin/python3 with -E -s -S, and a run under some
+      # other interpreter is not testing the thing that ships.
+      - name: Record the interpreter
+        run: /usr/bin/python3 -VV
+
+      - name: Compile every daemon and helper module
+        run: /usr/bin/python3 -m py_compile src/*.py
+
+      - name: Parse both shell scripts
+        run: bash -n src/install.sh src/uninstall.sh
+
+      - name: Run the suite
+        run: /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
+
+      # --dry-run is unprivileged and changes nothing. It exercises argument
+      # parsing, the rendered watchlist, the interpreter check and the whole
+      # printed plan, which is the half of the installer a test can reach.
+      - name: Installer dry run
+        run: |
+          bash src/install.sh --dry-run --watch demo=/tmp/demo --owner-uid 501
