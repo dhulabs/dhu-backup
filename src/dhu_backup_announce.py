@@ -337,6 +337,10 @@ def announce(abs_path, install_root=DEFAULT_INSTALL_ROOT, now=None):
 _MAX_ROOTS_SHOWN = 6
 
 _HEALTH_NOTE = {
+    # Present tense for a thing that has not happened yet, and no hedging: the
+    # store is still growing, which is exactly why there is time to act.
+    "warning": "!! CAPTURE WILL STOP — a store-wide budget is close; capture is "
+               "still running",
     "degraded": "!! CAPTURE STOPPED — nothing has been captured since it degraded",
     "unprotected": "!! THE DAEMON IS WATCHING NOTHING — no usable watch roots",
     "scan-failed": "!! EVERY CAPTURE IS FAILING",

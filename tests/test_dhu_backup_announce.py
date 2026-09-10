@@ -320,6 +320,9 @@ class AnnounceLookupTests(FixtureCase):
             ("{not json", "unreadable-heartbeat"),
             ({"state": "ok", "last_scan_epoch": int(time.time())}, "ok"),
             ({"state": "ok", "last_scan_epoch": int(time.time()) - 4000}, "stale"),
+            ({"state": "warning", "last_scan_epoch": int(time.time()),
+              "warning_reason": ["free-space-low"],
+              "warning_detail": "12.0 GiB free, and capture stops at 10.0 GiB"}, "warning"),
             ({"state": "degraded", "degraded_reason": "store-ceiling"}, "degraded"),
             ({"state": "unprotected"}, "unprotected"),
             ({"state": "scan-failed", "scan_error": "boom"}, "scan-failed"),
@@ -912,3 +915,154 @@ class SourceInvariantTests(unittest.TestCase):
         # and `wheel` is not a group name on Ubuntu. The property being asserted
         # is unchanged — everything the daemon executes is installed root-owned.
         self.assertRegex(source, r'install -o root -g 0 -m "\$_mode"')
+
+
+# ── E: the `warning` state, end to end on every surface ───────────────────────
+
+
+WARNING_STATE = {
+    "state": "warning",
+    "warning_reason": ["free-space-low"],
+    "warning_detail": "12.0 GiB free, and capture stops at 10.0 GiB",
+    "free_bytes": 12884901888, "min_free_bytes": 10737418240,
+    "files_scanned": 4, "store_bytes": 100, "watch_roots": 2,
+}
+
+
+def warning_state(**overrides):
+    state = dict(WARNING_STATE, last_scan_epoch=int(time.time()))
+    state.update(overrides)
+    return state
+
+
+class WarningSurfaceTests(FixtureCase):
+    """`warning` has to arrive on every surface the other states arrive on.
+
+    A state that only the heartbeat knows about is a state nobody reads. These
+    are the four places a human or an agent actually learns the daemon's health:
+    the helper's banner, `--json`, the announcement renderer and the MCP tools.
+    """
+
+    def helper(self, *argv):
+        env = dict(os.environ, TZ="UTC")
+        return subprocess.run(
+            [PYTHON, "-E", "-s", "-S", HELPER, "--install-root", self.install_root]
+            + list(argv), capture_output=True, text=True, env=env)
+
+    def test_the_helper_banners_the_warning_before_the_answer(self):
+        write_state(self.install_root, warning_state())
+        done = self.helper("ls", "heartbeat")
+        self.assertTrue(done.stdout.startswith("!! CAPTURE WILL STOP (free-space-low)"),
+                        done.stdout[:200])
+        self.assertIn("12.0 GiB free", done.stdout)
+        # The answer still comes, because capture is still running.
+        self.assertIn("heartbeat.ts", done.stdout)
+        self.assertEqual(done.returncode, 0)
+
+    def test_a_warning_is_a_FIELD_in_json_mode_and_never_a_printed_line(self):
+        write_state(self.install_root, warning_state())
+        done = self.helper("ls", "heartbeat", "--json")
+        payload = json.loads(done.stdout)          # would raise on a prose banner
+        self.assertEqual(payload["health"]["verdict"], "warning")
+        self.assertIn("12.0 GiB", payload["health"]["detail"])
+
+    def test_both_reasons_reach_the_banner(self):
+        write_state(self.install_root, warning_state(
+            warning_reason=["free-space-low", "store-nearly-full"]))
+        done = self.helper("ls", "heartbeat")
+        self.assertIn("free-space-low,store-nearly-full", done.stdout)
+
+    def test_a_warning_with_no_detail_recorded_still_banners(self):
+        state = warning_state()
+        del state["warning_detail"]
+        write_state(self.install_root, state)
+        done = self.helper("ls", "heartbeat")
+        self.assertIn("CAPTURE WILL STOP", done.stdout)
+        self.assertEqual(done.stderr, "")
+
+    def test_the_announcement_renderer_prints_the_note_above_the_result(self):
+        write_state(self.install_root, warning_state())
+        result = dhu_backup_announce.announce(FIXTURE_REPO + "/lib/heartbeat.ts",
+                                              install_root=self.install_root)
+        self.assertEqual(result.health, "warning")
+        text = dhu_backup_announce.format_text(result)
+        self.assertTrue(text.startswith("!! CAPTURE WILL STOP"), text[:120])
+        self.assertIn("HELD", text)
+
+    def test_a_warning_does_not_change_what_the_lookup_FINDS(self):
+        """It is a report about the daemon, never a verdict about the file."""
+        write_state(self.install_root, warning_state())
+        warned = dhu_backup_announce.announce(FIXTURE_REPO + "/lib/heartbeat.ts",
+                                              install_root=self.install_root)
+        write_state(self.install_root, fresh_ok_state())
+        healthy = dhu_backup_announce.announce(FIXTURE_REPO + "/lib/heartbeat.ts",
+                                               install_root=self.install_root)
+        self.assertEqual(warned.status, healthy.status)
+        self.assertEqual(len(warned.versions), len(healthy.versions))
+        self.assertNotEqual(warned.health, healthy.health)
+
+    def test_a_not_held_file_under_a_warning_still_says_the_daemon_is_warning(self):
+        """The renderer is not the hook: asked directly, it always reports health."""
+        write_state(self.install_root, warning_state())
+        result = dhu_backup_announce.announce(FIXTURE_REPO + "/lib/gone.ts",
+                                              install_root=self.install_root)
+        self.assertEqual(result.status, "not-held")
+        self.assertEqual(result.health, "warning")
+        self.assertIn("CAPTURE WILL STOP", dhu_backup_announce.format_text(result))
+
+    def test_every_health_verdict_has_a_note_in_the_renderer(self):
+        """`ok` is the only verdict with no note, because it has nothing to say."""
+        noted = set(dhu_backup_announce._HEALTH_NOTE)
+        self.assertEqual(set(dhu_backup_core.HEALTH_VERDICTS) - noted, {"ok"})
+        self.assertIn("warning", noted)
+
+
+class WarningMcpToolTests(FixtureCase):
+    """The MCP tools carry the verdict on every result, `warning` included.
+
+    A separate class rather than a subclass of `McpServerTests`: inheriting that
+    class would re-run its whole suite under a second name, and a suite that
+    counts the same assertions twice is a count nobody can reason about.
+    """
+
+    def converse(self, messages):
+        done = subprocess.run(
+            [PYTHON, "-E", "-s", "-S", MCP, "--install-root", self.install_root],
+            input="".join(json.dumps(m) + "\n" for m in messages),
+            capture_output=True, text=True, env=dict(os.environ, TZ="UTC"))
+        return [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def call(request_id, name, arguments):
+        return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}}
+
+    @staticmethod
+    def verdict_of(payload):
+        """`health` is a dict on the helper-backed tools and the verdict string
+        on the announcement-backed ones. Both shapes predate this change."""
+        health = payload["health"]
+        return health["verdict"] if isinstance(health, dict) else health
+
+    def test_every_tool_result_carries_the_warning_verdict(self):
+        write_state(self.install_root, warning_state())
+        responses = self.converse([
+            self.call(1, "dhu_backup_ls", {"substring": "heartbeat"}),
+            self.call(2, "dhu_backup_log", {"path": "lib/heartbeat.ts"}),
+            self.call(3, "dhu_backup_missing", {"path": FIXTURE_REPO + "/lib/gone.ts"}),
+        ])
+        self.assertEqual(len(responses), 3)
+        for response in responses:
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertEqual(self.verdict_of(payload), "warning", payload)
+
+    def test_the_same_tools_say_ok_on_a_healthy_daemon(self):
+        """The control: the field is reporting the heartbeat, not a constant."""
+        write_state(self.install_root, fresh_ok_state())
+        responses = self.converse([
+            self.call(1, "dhu_backup_ls", {"substring": "heartbeat"}),
+            self.call(2, "dhu_backup_missing", {"path": FIXTURE_REPO + "/lib/gone.ts"}),
+        ])
+        for response in responses:
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertEqual(self.verdict_of(payload), "ok", payload)

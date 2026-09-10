@@ -230,6 +230,39 @@ service_status_hint() {  # what a human types when it did not start
   esac
 }
 
+# PURE: what a post-install heartbeat label means for this script's exit code.
+# Three outcomes and no fourth, so every caller has to handle the middle one.
+#
+#   ok       the daemon is capturing comfortably   -> print the OK line, exit 0
+#   warning  the daemon is capturing and CLOSE to a store-wide budget that will
+#            stop it                               -> print the warning, exit 0
+#   fail     anything else, INCLUDING a label this version of the script does
+#            not know                              -> print it and exit 1
+#
+# `warning` exits 0 deliberately. A fresh install on a nearly-full volume works:
+# refusing to finish it would leave a human deciding whether a failed installer
+# had installed anything, and it teaches people to ignore the exit code. What it
+# must NOT do is print the bare "OK — the daemon is running and protecting the
+# roots above" line, which over a volume that will stop capture next week is
+# exactly the silent success this whole section exists to prevent.
+#
+# An UNKNOWN label is `fail`, never `ok`: the same rule `health_verdict` follows
+# in the Python. An old installer against a newer daemon says so.
+install_state_verdict() {  # $1 = the "state" label from var/state.json
+  case "${1:-}" in
+    ok)      echo "ok" ;;
+    warning) echo "warning" ;;
+    *)       echo "fail" ;;
+  esac
+}
+
+service_restart_hint() {  # what a human types after editing a file in etc/
+  case "$SERVICE_KIND" in
+    launchd) echo "sudo launchctl kickstart -k system/$LABEL" ;;
+    systemd) echo "sudo systemctl restart $LABEL.service" ;;
+  esac
+}
+
 # Is a systemd manager actually running? `--no-service` is gated on this being
 # FALSE, which is what keeps the flag off a real host: /run/systemd/system exists
 # on every booted systemd machine and exists in no container started without it.
@@ -876,7 +909,21 @@ for _ in $(seq 1 60); do
 done
 if [ "$NOW_EPOCH" -gt "$BEFORE_EPOCH" ]; then
   echo "STATE: $(tr -d '\n' < "$DEST/var/state.json" | cut -c1-400)"
-  if grep -q '"state": "ok"' "$DEST/var/state.json"; then
+  # "ok" or "warning" — both mean the daemon is running and capturing.
+  #
+  # `warning` is ACCEPTED here rather than treated as a non-OK state, and the
+  # reason is that the alternative is worse: on a nearly-full volume a fresh
+  # install would work perfectly and then exit 1, and the human would be left
+  # deciding whether a failed installer had installed anything. Refusing to
+  # finish an install that is working teaches people to ignore the exit code.
+  #
+  # What it must NOT do is print the bare OK line. "OK — the daemon is running
+  # and protecting the roots above" over a volume that will stop capture next
+  # week is precisely the silent-success this section exists to prevent, so the
+  # warning is printed in its place, with what to do about it.
+  STATE_LABEL=$(sed -n 's/.*"state": *"\([a-z-]*\)".*/\1/p' "$DEST/var/state.json" | head -1)
+  STATE_VERDICT=$(install_state_verdict "$STATE_LABEL")
+  if [ "$STATE_VERDICT" != "fail" ]; then
     # "protecting the roots above" is a claim about EVERY root listed, so the
     # heartbeat's own counts must agree with it: one refused root (a path that
     # does not exist, a component owned by someone else) is logged by the daemon
@@ -890,9 +937,23 @@ if [ "$NOW_EPOCH" -gt "$BEFORE_EPOCH" ]; then
       echo "   Each refusal names its reason in $DEST/var/dhu-backupd.log (grep 'watch root')."
       exit 1
     fi
-    echo "OK — the daemon is running and protecting the roots above (${ACTIVE} active, 0 refused)."
+    if [ "$STATE_VERDICT" = "warning" ]; then
+      WARN_DETAIL=$(sed -n 's/.*"warning_detail": *"\([^"]*\)".*/\1/p' "$DEST/var/state.json" | head -1)
+      echo "!! INSTALLED AND CAPTURING — BUT CAPTURE WILL STOP."
+      echo "   ${WARN_DETAIL:-a store-wide budget is close; see warning_reason in var/state.json}"
+      echo "   ${ACTIVE} watch root(s) active, 0 refused. Everything above is installed and working."
+      echo "   Capture stopping is by design and it NEVER self-heals: when a store-wide"
+      echo "   budget binds, the daemon stops and keeps what it holds until a human acts."
+      echo "   Act now, not then — free space on this volume, or raise the budget:"
+      echo "     sudo vi $DEST/etc/dhu-backupd.conf     # min_free_bytes, max_store_bytes"
+      echo "     $(service_restart_hint)"
+      echo "   Watch it with: $DEST/bin/dhu-backup ls <filename>   (it banners the state)"
+    else
+      echo "OK — the daemon is running and protecting the roots above (${ACTIVE} active, 0 refused)."
+    fi
   else
-    echo "!! the daemon wrote a NON-OK state (above). Check $DEST/var/dhu-backupd.log"
+    echo "!! the daemon wrote the state '${STATE_LABEL:-<unreadable>}', which is neither"
+    echo "   'ok' nor 'warning'. Check $DEST/var/dhu-backupd.log"
     exit 1
   fi
 else
@@ -918,6 +979,19 @@ case "$SERVICE_KIND" in
   systemd) echo "  The daemon reads it at STARTUP: sudo systemctl restart $LABEL.service" ;;
 esac
 echo "  Watch var/state.json for vault_extra_globs and vault_extra_refused."
+echo
+# Also NOT shipped, and for a sharper version of the same reason: every line in
+# this one REMOVES protection. An example file that goes live on an uncomment
+# would be a directory silently stopping being protected.
+echo "skip a large directory inside a watch root (optional):"
+echo "  sudo tee $DEST/etc/exclude.conf   # one DIRECTORY-NAME glob per line, '#' comments"
+echo "  e.g.  fixtures       (matched on the directory NAME only; no '/' and no '..')"
+echo "  The opposite of vault-extra.conf: that file can only ADD protection, this"
+echo "  one can only REMOVE it. It is acceptable only because it is root-owned 0644"
+echo "  beside watchlist.conf, which already decides what is protected at all."
+echo "  The daemon reads it at STARTUP: $(service_restart_hint)"
+echo "  Watch var/state.json for exclude_globs, exclude_refused, and"
+echo "  refusals_by_reason['walk-excluded-dir-operator'] — the count that proves it fired."
 echo
 echo "check on it later:"
 case "$SERVICE_KIND" in

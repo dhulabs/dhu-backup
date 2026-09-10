@@ -61,6 +61,25 @@ HOOK_EVENT = "PostToolUseFailure"
 #: protected is an ordinary error, and a hook that comments on every one of them
 #: is noise that gets the hook turned off. `store-unavailable` IS here, because
 #: a protection that cannot be read is a finding, not a non-event.
+#:
+#: **The daemon's HEALTH does not change this list, and `warning` in particular
+#: does not.** The question was whether a `warning` heartbeat should make the
+#: hook speak for a `not-held` file too. It should not, for three reasons.
+#: First, the trigger for speaking is what the store holds for THIS path, and a
+#: warning says nothing about this path — the file is not held for reasons that
+#: have nothing to do with the budget. Second, `warning` means capture is still
+#: running normally, so it is strictly less severe than `degraded`, which does
+#: not open this list either; a state that made the hook chattier than the state
+#: above it would be inverted. Third, the failure mode that kills a hook is
+#: noise on an agent's error path: speaking on every ordinary file-not-found for
+#: as long as a volume is tight is weeks of noise, and the hook gets turned off
+#: before the budget is ever hit.
+#:
+#: A warning still reaches the agent whenever the hook DOES speak, because
+#: `dhu_backup_announce.format_text` puts the health note above every block.
+#: The right audience for "free space is low" is the operator reading
+#: `state.json`, the install banner and the log — not an agent recovering from
+#: an unrelated failed read.
 ANNOUNCED_STATUSES = ("held", "held-directory", "vaulted", "store-unavailable")
 
 LEAD_IN = {

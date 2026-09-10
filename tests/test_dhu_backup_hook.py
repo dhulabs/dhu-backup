@@ -154,7 +154,15 @@ class AnnouncedStatusTests(unittest.TestCase):
 # ── the hook as a subprocess ──────────────────────────────────────────────────
 
 
-class HookSubprocessTests(FixtureCase):
+class _HookDriver(object):
+    """How this file drives the hook: a real subprocess, fabricated stdin.
+
+    A MIXIN and not a base class with tests in it. Subclassing a TestCase to
+    reuse its helpers re-runs every test it holds under a second name, and a
+    suite that counts the same assertions twice is a count nobody can reason
+    about.
+    """
+
     def fire(self, payload, install_root=None):
         """Run the hook with `payload` on stdin. Returns (returncode, parsed, raw)."""
         root = self.install_root if install_root is None else install_root
@@ -180,6 +188,9 @@ class HookSubprocessTests(FixtureCase):
         self.assertEqual(parsed["hookSpecificOutput"]["hookEventName"],
                          "PostToolUseFailure")
         return parsed["hookSpecificOutput"]["additionalContext"]
+
+
+class HookSubprocessTests(_HookDriver, FixtureCase):
 
     # -- held ----------------------------------------------------------------
 
@@ -367,3 +378,70 @@ class HookInstallTests(unittest.TestCase):
             source = handle.read()
         for forbidden in ("import subprocess", "os.system", "os.popen", "os.exec"):
             self.assertNotIn(forbidden, source)
+
+
+class HookUnderAWarningDaemonTests(_HookDriver, FixtureCase):
+    """What a `warning` heartbeat does, and deliberately does NOT do, to the hook.
+
+    The decision recorded here: a warning does NOT add a status to
+    `ANNOUNCED_STATUSES`, so it does not make the hook speak for a file the
+    mirror does not hold. Three reasons, and all three are asserted below rather
+    than only argued in a comment.
+
+      1. The trigger for speaking is what the store holds for THIS path. A
+         budget warning says nothing about this path.
+      2. `warning` is strictly less severe than `degraded`, which does not open
+         the list either. A state that made the hook chattier than the state
+         above it would be inverted.
+      3. Noise on an agent's error path is what gets a hook switched off, and a
+         tight volume is a condition that lasts weeks.
+
+    What a warning DOES do is travel on every block the hook already emits,
+    because the renderer puts the health note above the result.
+    """
+
+    def warn(self):
+        from test_dhu_backup_announce import warning_state
+        write_state(self.install_root, warning_state())
+
+    def test_a_held_file_carries_the_warning_to_the_agent(self):
+        self.warn()
+        done, parsed = self.fire(self.read_failure(FIXTURE_REPO + "/lib/heartbeat.ts"))
+        self.assertEqual(done.returncode, 0)
+        context = self.context(parsed)
+        self.assertIn("CAPTURE WILL STOP", context)
+        self.assertIn("HELD", context)
+        self.assertIn("3 version(s)", context)
+
+    def test_a_NOT_HELD_file_stays_silent_under_a_warning(self):
+        """The decision, asserted. A warning is not a reason to speak about a
+        file that was never protected."""
+        self.warn()
+        done, parsed = self.fire(self.read_failure(FIXTURE_REPO + "/lib/never-existed.ts"))
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+        self.assertIsNone(parsed)
+
+    def test_a_DEGRADED_daemon_is_silent_on_the_same_file(self):
+        """The comparison that makes the rule consistent: the more severe state
+        does not open the list either, so the less severe one must not."""
+        write_state(self.install_root, {"state": "degraded",
+                                        "degraded_reason": "free-space-floor",
+                                        "last_scan_epoch": 1788300000})
+        done, _parsed = self.fire(self.read_failure(FIXTURE_REPO + "/lib/never-existed.ts"))
+        self.assertEqual(done.stdout, "")
+
+    def test_the_announced_statuses_did_not_change(self):
+        """Health is not a status. The list is about the FILE."""
+        self.assertEqual(hook.ANNOUNCED_STATUSES,
+                         ("held", "held-directory", "vaulted", "store-unavailable"))
+        for verdict in ("warning", "degraded", "ok", "stale"):
+            self.assertNotIn(verdict, hook.ANNOUNCED_STATUSES)
+
+    def test_a_vaulted_path_also_carries_the_warning(self):
+        self.warn()
+        done, parsed = self.fire(self.read_failure(FIXTURE_REPO + "/.env.local"))
+        self.assertEqual(done.returncode, 0)
+        context = self.context(parsed)
+        self.assertIn("CAPTURE WILL STOP", context)
+        self.assertIn("VAULTED", context)

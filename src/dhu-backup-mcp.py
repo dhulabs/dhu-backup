@@ -108,6 +108,14 @@ class Args(object):
 
 
 def _health(install_root):
+    """The daemon's verdict, on EVERY tool result.
+
+    One of `dhu_backup_core.HEALTH_VERDICTS`, which is where the list lives —
+    this function names none of them, so a state added to the daemon reaches
+    every MCP tool without an edit here. `warning` ("capturing, but about to
+    stop") arrives that way and is not a kind of `ok`: a caller that treats it
+    as one is the caller this field exists for.
+    """
     verdict = dhu_backup_announce._read_health(install_root, time.time())
     return {"verdict": verdict.verdict, "detail": verdict.detail}
 

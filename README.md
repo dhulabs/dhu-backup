@@ -116,6 +116,12 @@ Every invocation prints the daemon's health first, so "no versions" is never
 mistaken for "capture stopped two days ago". In `--json` mode that verdict
 becomes a `health` field of the object, so it is carried rather than droppable.
 
+There are seven verdicts and `warning` is the one worth knowing about: it means
+capture is running normally but a store-wide budget is close, so it will stop.
+Capture stopping is by design and never self-heals, and the point of the warning
+is that you hear about it while there is still time to free space or raise the
+budget. `ok` means capturing comfortably; the two are never merged.
+
 A credential-class file is in the root-only vault, and recovering it is yours to
 do with sudo. It is a read and a shell redirect, never a `restore`:
 
@@ -198,6 +204,15 @@ the `fstat` of the *open* fd: regular file, `st_nlink == 1`, owned by the
 configured uid, not setuid or setgid, at most 1 MiB, outside the excluded
 directories and extensions. No path string is ever re-resolved, so there is no
 window in which a checked name can be swapped for a symlink or a hard link.
+
+The excluded directories are a built-in list — `node_modules`, `.git`, `dist`
+and the rest. An operator with a large directory of their own inside a watch
+root can add to it with an optional root-owned `etc/exclude.conf`, one
+directory-name glob per line. It is the mirror image of `etc/vault-extra.conf`
+and the asymmetry is the point: that file can only ADD protection, this one can
+only REMOVE it, and it is acceptable only because it sits root-owned 0644 beside
+the `watchlist.conf` that already decides what is protected at all. Every glob
+in force and every directory it skips are counted in the heartbeat.
 
 ## What it deliberately is not
 

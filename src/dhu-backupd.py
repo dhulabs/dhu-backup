@@ -94,6 +94,18 @@ class Config(object):
         # rules", never an AttributeError halfway through a copy decision.
         self.extra_vault_globs = ()
         self.extra_vault_refusals = ()
+        # The operator's optional directory exclusions, loaded once at startup
+        # by `load_exclude`. Empty here for the same reason as the pair above: a
+        # walk that runs without the startup path must get "no operator
+        # exclusions", never an AttributeError halfway down a tree.
+        #
+        # NOTE THE ASYMMETRY, spelled out at `dhu_backup_core.parse_exclude`:
+        # the pair above can only ADD protection, this pair can only REMOVE it.
+        # Both files are root-owned 0644 beside `watchlist.conf`, which already
+        # decides what is protected at all, and none of the three is writable by
+        # the owner's account.
+        self.exclude_globs = ()
+        self.exclude_refusals = ()
 
     @property
     def var_dir(self):
@@ -153,6 +165,18 @@ class Config(object):
         """
         return os.path.join(self.root, "etc", dhu_backup_core.VAULT_EXTRA_FILENAME)
 
+    @property
+    def exclude_path(self):
+        """etc/exclude.conf — OPTIONAL, and subtractive-only by construction.
+
+        Read from the same root-owned etc/ as every other config, and never
+        shipped by the installer: the operator creates it or it does not exist.
+        An example file in etc/ becomes a live config the moment somebody
+        uncomments a line, and this is the one file in the tree whose lines can
+        only make the store hold LESS.
+        """
+        return os.path.join(self.root, "etc", dhu_backup_core.EXCLUDE_FILENAME)
+
 
 def load_config(path):
     values = {}
@@ -192,6 +216,26 @@ def load_vault_extra(config):
     except (IOError, OSError) as exc:
         return (), ((path, "unreadable:%s" % _errname(exc)),)
     return dhu_backup_core.parse_vault_extra(text)
+
+
+def load_exclude(config):
+    """`(globs, refusals)` from etc/exclude.conf. Absent is not an error.
+
+    An unreadable file is NOT an empty one, and here that distinction decides
+    how much gets protected: "I could not read your exclusions" leaves the whole
+    tree protected and SAYS SO through `exclude_refused`, while an empty list
+    would look like an operator who never wrote the file. The daemon must not
+    merge those, in either direction.
+    """
+    path = config.exclude_path
+    if not os.path.exists(path):
+        return (), ()
+    try:
+        with open(path) as handle:
+            text = handle.read()
+    except (IOError, OSError) as exc:
+        return (), ((path, "unreadable:%s" % _errname(exc)),)
+    return dhu_backup_core.parse_exclude(text)
 
 
 # ── logging (H4: paths and decisions, never content) ─────────────────────────
@@ -528,7 +572,7 @@ def open_root_fd(path):
 MAX_WALK_DEPTH = 32
 
 
-def walk_root(root_fd, counters, logger, on_file, absolute_root=None):
+def walk_root(root_fd, counters, logger, on_file, absolute_root=None, exclude_globs=()):
     """Depth-first walk over directory file descriptors. Does not close root_fd.
 
     No path string is ever re-resolved (C8): each directory is opened
@@ -540,11 +584,21 @@ def walk_root(root_fd, counters, logger, on_file, absolute_root=None):
     PENDING directory, so a single directory with 500 subdirectories exhausts a
     256-fd limit before the walk descends once. Recursion holds one fd per level
     of DEPTH, capped at MAX_WALK_DEPTH.
+
+    `exclude_globs` is the operator's optional `etc/exclude.conf` list. It is a
+    WALK rule and lives only here: the whole value of it is that a 33 GB
+    directory costs one `scandir` entry instead of a descent, and a rule applied
+    at admission would have to walk the tree first to apply it. `classify_entry`
+    keeps its own copy of the BUILT-IN list as defence in depth and does not
+    know about this one; if a path ever reached admission from somewhere other
+    than this walk, it would be admitted rather than excluded — the direction
+    that protects MORE, which is the safe one for a subtractive rule.
     """
-    _walk_dir(root_fd, "", counters, logger, on_file, 0, absolute_root)
+    _walk_dir(root_fd, "", counters, logger, on_file, 0, absolute_root, exclude_globs)
 
 
-def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=None):
+def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=None,
+              exclude_globs=()):
     if absolute_dir is not None and len(counters.directories) < MAX_WATCHED_DIRS:
         # Path strings collected here feed the kqueue TRIGGER only. Capture
         # itself never re-resolves a path (C8); a trigger fd pointing somewhere
@@ -566,6 +620,20 @@ def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=N
                             counters.refuse("walk-excluded-dir")
                             log_refusal_once(logger, "exdir|" + child_rel,
                                              "not descending excluded dir: %s" % child_rel)
+                            continue
+                        # Counted under its OWN reason, never merged into the
+                        # built-in one above. An operator who writes a glob and
+                        # sees no counter move cannot tell "the rule is working"
+                        # from "the rule never matched", and the second is the
+                        # one that costs them the disk they were trying to save.
+                        operator_glob = dhu_backup_core.exclude_glob_match(
+                            entry.name, exclude_globs)
+                        if operator_glob is not None:
+                            counters.refuse("walk-excluded-dir-operator")
+                            log_refusal_once(
+                                logger, "opdir|" + child_rel,
+                                "not descending %s: operator exclude.conf glob %r"
+                                % (child_rel, operator_glob))
                             continue
                         subdirectories.append((entry.name, child_rel))
                         continue
@@ -597,7 +665,8 @@ def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=N
             continue
         try:
             _walk_dir(child_fd, child_rel, counters, logger, on_file, depth + 1,
-                      os.path.join(absolute_dir, name) if absolute_dir else None)
+                      os.path.join(absolute_dir, name) if absolute_dir else None,
+                      exclude_globs)
         finally:
             os.close(child_fd)
 
@@ -1287,7 +1356,8 @@ def scan_once(config, connection, logger, state):
                 os.close(file_fd)
 
         try:
-            walk_root(root_fd, counters, logger, handle_file, watch_root)
+            walk_root(root_fd, counters, logger, handle_file, watch_root,
+                      exclude_globs=config.exclude_globs)
         finally:
             os.close(root_fd)
 
@@ -1459,13 +1529,18 @@ def _prune_and_record(config, connection, logger, state):
 
 
 def write_state(config, state, counters, store_bytes, free_bytes, roots, refused_roots,
-                scan_error=None, trigger=None, interpreter_ok=None):
+                scan_error=None, trigger=None, interpreter_ok=None, logger=None):
     """state.json — counts and state ONLY, never paths (H4).
 
-    FOUR distinguishable states, because a reader must be able to tell these
+    FIVE distinguishable states, because a reader must be able to tell these
     apart and the first version could not:
 
-      ok            mirroring, with at least one usable watch root.
+      ok            mirroring comfortably, with at least one usable watch root.
+      warning       mirroring NORMALLY, and close to a store-wide budget that
+                    will stop it. Never conflated with `ok`: capture ending is
+                    designed for, capture ending with no notice is the defect.
+                    A volume at 99% full with 16.1 GiB free against a 10 GiB
+                    floor reported `ok` up to the cycle that stopped it.
       degraded      a store-wide budget stopped it. Never self-heals.
       unprotected   the daemon is alive and healthy and is watching NOTHING —
                     an unreadable watchlist, every root refused, or a wrong
@@ -1476,12 +1551,22 @@ def write_state(config, state, counters, store_bytes, free_bytes, roots, refused
                     rewritten, so it kept describing the last SUCCESSFUL scan
                     and read as "ok" for the whole staleness window.
     """
+    # Computed here rather than passed in: it is a pure function of the two
+    # numbers already on their way into this payload, so it cannot disagree with
+    # the `store_bytes` and `free_bytes` printed beside it.
+    warning = dhu_backup_core.budget_warning(store_bytes or 0, free_bytes, config.limits)
+
+    # Ordered most-severe first. `warning` sits BELOW the three failures because
+    # it is a forecast about a daemon that is capturing, and each of those three
+    # says it is not capturing (or is protecting nothing) right now.
     if state.get("degraded_reason"):
         status = "degraded"
     elif scan_error is not None:
         status = "scan-failed"
     elif roots == 0:
         status = "unprotected"
+    elif warning is not None:
+        status = "warning"
     else:
         status = "ok"
 
@@ -1500,6 +1585,14 @@ def write_state(config, state, counters, store_bytes, free_bytes, roots, refused
         # they believe is protecting something is not.
         "vault_extra_globs": len(config.extra_vault_globs),
         "vault_extra_refused": len(config.extra_vault_refusals),
+        # The SUBTRACTIVE operator extension, reported the same way and for a
+        # sharper reason: every glob in force here is protection the operator
+        # has switched off, and every refused line is a directory they believe
+        # is being skipped and is not. `refusals_by_reason` carries
+        # `walk-excluded-dir-operator` beside these, so "the rule exists" and
+        # "the rule fired" are two separate, visible facts.
+        "exclude_globs": len(config.exclude_globs),
+        "exclude_refused": len(config.exclude_refusals),
         "versions_rolled": counters.rolled,
         "refusals_by_reason": counters.refusals,
         # Files whose copy was DEFERRED to a later scan by the per-scan
@@ -1526,17 +1619,54 @@ def write_state(config, state, counters, store_bytes, free_bytes, roots, refused
         "watch_roots_refused": refused_roots,
         "store_bytes": store_bytes,
         "free_bytes": free_bytes,
+        # The two numbers those are measured AGAINST, always present rather than
+        # only under `warning`. "16.1 GiB free" is not a fact a reader can act
+        # on without the floor it is heading for, and a reader who has to open
+        # etc/dhu-backupd.conf to interpret the heartbeat will not.
+        "min_free_bytes": config.limits.min_free_bytes,
+        "max_store_bytes": config.limits.max_store_bytes,
         "retention_days": config.retention_days,
         "interval_seconds": config.interval_seconds,
         "prune_last_removed": state.get("prune_last_removed"),
         "prune_last_failed": state.get("prune_last_failed"),
     }
+    if warning is not None:
+        # A LIST, always, even for one reason. Both triggers can be true at
+        # once — a nearly-full store on a nearly-full volume is one situation,
+        # not two heartbeats — and a single-string field would force a lossy
+        # choice between two live facts. A reader parses one shape.
+        payload["warning_reason"] = list(warning.reasons)
+        payload["warning_detail"] = warning.detail
     if state.get("degraded_reason"):
         payload["degraded_reason"] = state["degraded_reason"]
         payload["degraded_since_epoch"] = state.get("degraded_since")
     if scan_error is not None:
         payload["scan_error"] = scan_error
     write_json_atomic(config, config.state_path, payload, STATE_FILE_MODE)
+    _log_warning_transition(state, warning, logger)
+
+
+def _log_warning_transition(state, warning, logger):
+    """Log a budget warning when it ARRIVES or CHANGES, and when it clears.
+
+    Deliberately NOT every cycle, which is where this differs from the DEGRADED
+    line. Degraded is a terminal condition an operator may be tailing for, and
+    it stops the log growing by stopping capture. A warning is the steady state
+    for as long as the volume is tight: one line per 15 s scan is 5,760 lines a
+    day into a root-owned file with no rotation, on the same volume whose free
+    space is what the warning is about. The heartbeat carries it every cycle;
+    the log carries the EVENT.
+    """
+    previous = state.get("warning_reason")
+    current = list(warning.reasons) if warning is not None else None
+    state["warning_reason"] = current
+    if logger is None or current == previous:
+        return
+    if current:
+        logger.warn("WARNING (%s) — %s. Capture is still running; it will STOP, and "
+                    "stopping never self-heals." % (",".join(current), warning.detail))
+    elif previous:
+        logger.info("warning cleared (%s) — back inside the budgets" % ",".join(previous))
 
 
 def load_persisted_state(config):
@@ -1628,6 +1758,18 @@ def main(argv=None):
         # is in force and is not.
         logger.error("vault-extra REFUSED %r: %s" % (line, reason))
 
+    config.exclude_globs, config.exclude_refusals = load_exclude(config)
+    if config.exclude_globs:
+        # WARN and not INFO. Every glob here is protection the operator has
+        # switched off, and it is the one config in the tree that can only
+        # subtract. The count belongs in the log at a level someone greps for.
+        logger.warn("exclude.conf: %d directory-name glob(s) from %s — directories "
+                    "matching these are NOT protected: %s"
+                    % (len(config.exclude_globs), config.exclude_path,
+                       ", ".join(repr(g) for g in config.exclude_globs)))
+    for line, reason in config.exclude_refusals:
+        logger.error("exclude.conf REFUSED %r: %s" % (line, reason))
+
     connection = open_index(config)
     if meta_get(connection, "store_bytes") is None:
         measured = (measure_store_bytes(config.store_dir)
@@ -1702,7 +1844,7 @@ def main(argv=None):
         try:
             write_state(config, state, counters, store_bytes, free_bytes, roots, refused,
                         scan_error=scan_error, trigger=trigger,
-                        interpreter_ok=interpreter_ok)
+                        interpreter_ok=interpreter_ok, logger=logger)
         except Exception as exc:  # noqa: BLE001
             # The heartbeat is the only surface a reader has. If publishing it
             # fails, say so on the one channel that is left.

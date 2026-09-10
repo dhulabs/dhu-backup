@@ -114,6 +114,25 @@ store-wide budget hit stops capture entirely until a human intervenes: DEGRADED
 never self-heals, deliberately, because "prune to make room" converts a
 guarantee into a best-effort cache whose only symptom is a missing file.
 
+The daemon now says so on the way down rather than only at the bottom. Inside
+1.5x the free-space floor, or above 80% of the store ceiling, `state` is
+`warning` and capture continues normally. That is notice, not a reprieve: the
+stop still comes, and it still needs a human.
+
+## 7a. An operator can switch protection off for a named directory
+
+`etc/exclude.conf` is optional, root-owned 0644, and every line in it removes
+protection from directories matching one name glob. A directory named there is
+not walked and nothing inside it is captured, reported only as the counter
+`walk-excluded-dir-operator` and the `exclude_globs` count in the heartbeat.
+
+This is a boundary rather than a hole: the file sits beside `watchlist.conf`,
+which already decides what is protected at all, and anything able to write
+either could un-protect everything in one line. Neither is writable by the
+account an agent runs as. But an operator who writes a glob more broadly than
+they meant has removed protection they still believe they have, and the only
+signal is a counter.
+
 ## 8. The installer is a one-time trust transfer
 
 `install.sh` ships from a directory an agent can write, and it runs under sudo.

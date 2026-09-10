@@ -1572,3 +1572,319 @@ class VaultExtraAnnouncementTests(unittest.TestCase):
     def test_the_built_in_predicate_still_announces_vaulted(self):
         announcement = self._announce(".env.local", ())
         self.assertEqual(announcement.status, "vaulted")
+
+
+# ── the warning band, and the exclusion list ──────────────────────────────────
+
+
+class BudgetWarningTests(unittest.TestCase):
+    """`warning` is a STATE, not an annotation on `ok`.
+
+    Capture ENDING is designed for. Capture ending with NO NOTICE is the defect,
+    and it was live: a volume at 99% with 16.1 GiB free against a 10 GiB floor
+    reported `ok` up to the cycle that stopped it and `degraded` for ever after.
+    """
+
+    GiB = 1024 ** 3
+
+    def warn(self, **overrides):
+        args = dict(store_bytes=0, free_bytes=100 * self.GiB)
+        args.update(overrides)
+        return dhu_backup_core.budget_warning(**args)
+
+    def test_a_comfortable_store_on_a_roomy_volume_warns_about_nothing(self):
+        self.assertIsNone(self.warn())
+
+    def test_free_space_inside_one_and_a_half_floors_warns(self):
+        floor = dhu_backup_core.MIN_FREE_BYTES
+        warning = self.warn(free_bytes=int(floor * 1.4))
+        self.assertIsNotNone(warning)
+        self.assertEqual(warning.reasons, ("free-space-low",))
+        self.assertIn("GiB", warning.detail)
+
+    def test_the_free_space_multiplier_is_the_named_constant_not_a_literal(self):
+        """A threshold nobody can find from the heartbeat is a threshold nobody acts on."""
+        floor = dhu_backup_core.MIN_FREE_BYTES
+        multiplier = dhu_backup_core.FREE_SPACE_WARNING_MULTIPLIER
+        self.assertEqual(multiplier, 1.5)
+        # Just inside the band warns; just outside it does not. Both sides, so
+        # moving the constant cannot leave this test passing on the old value.
+        self.assertIsNotNone(self.warn(free_bytes=int(floor * multiplier) - 1))
+        self.assertIsNone(self.warn(free_bytes=int(floor * multiplier) + 1))
+
+    def test_a_store_above_eighty_percent_of_its_ceiling_warns(self):
+        ceiling = dhu_backup_core.MAX_STORE_BYTES
+        fraction = dhu_backup_core.STORE_WARNING_FRACTION
+        self.assertEqual(fraction, 0.8)
+        warning = self.warn(store_bytes=int(ceiling * fraction) + 1)
+        self.assertEqual(warning.reasons, ("store-nearly-full",))
+        self.assertIsNone(self.warn(store_bytes=int(ceiling * fraction) - 1))
+
+    def test_both_triggers_are_reported_together_in_a_fixed_order(self):
+        warning = self.warn(
+            store_bytes=int(dhu_backup_core.MAX_STORE_BYTES * 0.9),
+            free_bytes=int(dhu_backup_core.MIN_FREE_BYTES * 1.2),
+        )
+        self.assertEqual(warning.reasons, ("free-space-low", "store-nearly-full"))
+        # Deterministic: the same inputs produce byte-identical heartbeat text.
+        self.assertEqual(warning, self.warn(
+            store_bytes=int(dhu_backup_core.MAX_STORE_BYTES * 0.9),
+            free_bytes=int(dhu_backup_core.MIN_FREE_BYTES * 1.2),
+        ))
+
+    def test_every_reason_it_can_return_is_in_the_declared_vocabulary(self):
+        for reasons in [self.warn(free_bytes=dhu_backup_core.MIN_FREE_BYTES).reasons,
+                        self.warn(store_bytes=dhu_backup_core.MAX_STORE_BYTES - 1).reasons]:
+            for reason in reasons:
+                self.assertIn(reason, dhu_backup_core.WARNING_REASONS)
+
+    def test_a_warning_is_never_also_a_stop(self):
+        """The relationship, as a PROPERTY over a grid — not a comment.
+
+        `budget_warning` describes "about to stop". If `budget_decision` would
+        already return Degraded for the same store size and free space, the
+        thing to report is the STOP, and a warning would be a second, softer
+        description of a condition that is not soft. Asserted over the whole
+        grid rather than at the two thresholds, so a future change to either
+        function that lets the two overlap fails here.
+        """
+        ceiling = dhu_backup_core.MAX_STORE_BYTES
+        floor = dhu_backup_core.MIN_FREE_BYTES
+        stores = [0, 1, ceiling // 2, int(ceiling * 0.79), int(ceiling * 0.8),
+                  int(ceiling * 0.81), ceiling - 1, ceiling, ceiling + 1, ceiling * 3]
+        frees = [0, 1, floor - 1, floor, floor + 1, int(floor * 1.49),
+                 int(floor * 1.5), int(floor * 1.51), floor * 10, None]
+        overlaps = []
+        both_seen = {"warned": 0, "degraded": 0}
+        for store in stores:
+            for free in frees:
+                warning = dhu_backup_core.budget_warning(store, free)
+                stopped = isinstance(
+                    budget_decision(store, floor if free is None else free, 0), Degraded)
+                if stopped:
+                    both_seen["degraded"] += 1
+                if warning is not None:
+                    both_seen["warned"] += 1
+                if warning is not None and stopped:
+                    overlaps.append((store, free, warning.reasons))
+        self.assertEqual(overlaps, [], "a warning described a condition that is a stop")
+        # A property proven over a population where neither case occurs proves
+        # nothing. Both must actually appear in this grid.
+        self.assertGreater(both_seen["warned"], 0)
+        self.assertGreater(both_seen["degraded"], 0)
+
+    def test_an_unmeasured_free_space_never_invents_a_free_space_warning(self):
+        """`statvfs` failing is its own fact, reported on its own path.
+
+        The daemon shipped this defect once in the other direction: a failed
+        measurement became `free_bytes = 0`, which became a permanent "the
+        volume is full" printed beside a heartbeat reporting 30 GB free.
+        """
+        self.assertIsNone(self.warn(free_bytes=None))
+        self.assertIsNone(self.warn(free_bytes=None, store_bytes=1000))
+
+    def test_an_unmeasured_free_space_does_not_hide_a_nearly_full_store(self):
+        """The two dimensions are independent; losing one must not lose the other."""
+        warning = self.warn(free_bytes=None,
+                            store_bytes=int(dhu_backup_core.MAX_STORE_BYTES * 0.9))
+        self.assertEqual(warning.reasons, ("store-nearly-full",))
+
+    def test_it_respects_the_limits_it_is_given_not_the_module_defaults(self):
+        tight = dhu_backup_core.DEFAULT_LIMITS._replace(
+            min_free_bytes=1000, max_store_bytes=1000)
+        self.assertIsNone(dhu_backup_core.budget_warning(0, 100 * self.GiB, tight))
+        warning = dhu_backup_core.budget_warning(0, 1400, tight)
+        self.assertEqual(warning.reasons, ("free-space-low",))
+
+    def test_the_human_sentence_stays_readable_at_every_scale(self):
+        """A staging run with a 1,100-byte ceiling printed "the store holds
+        0.0 GiB of its 0.0 GiB ceiling" — a sentence that reports nothing, read
+        by exactly the operator who set a small budget on purpose."""
+        tiny = dhu_backup_core.DEFAULT_LIMITS._replace(max_store_bytes=1100,
+                                                       min_free_bytes=4096)
+        warning = dhu_backup_core.budget_warning(901, 100 * self.GiB, tiny)
+        self.assertIn("901 bytes", warning.detail)
+        self.assertIn("1.1 KiB", warning.detail)
+        self.assertNotIn("0.0 GiB", warning.detail)
+        big = dhu_backup_core.budget_warning(
+            int(dhu_backup_core.MAX_STORE_BYTES * 0.9), 100 * self.GiB)
+        self.assertIn("GiB", big.detail)
+
+    def test_it_is_not_a_gate_and_returns_no_verdict_type(self):
+        """Nothing consults this to decide whether to write.
+
+        It returns a record or None, never `Allow`/`Degraded`/`Skip`, so it
+        cannot be dropped into a decision site by accident.
+        """
+        warning = self.warn(free_bytes=dhu_backup_core.MIN_FREE_BYTES)
+        self.assertNotIsInstance(warning, (Allow, Degraded, Skip))
+        self.assertEqual(dhu_backup_core.BudgetWarning._fields, ("reasons", "detail"))
+
+
+class WarningHealthVerdictTests(unittest.TestCase):
+    """`warning` reaching the helper, and what beats it."""
+
+    def test_a_warning_heartbeat_becomes_the_warning_verdict(self):
+        verdict = health_verdict(
+            {"state": "warning", "last_scan_epoch": NOW,
+             "warning_reason": ["free-space-low"],
+             "warning_detail": "12.0 GiB free, and capture stops at 10.0 GiB"}, NOW)
+        self.assertEqual(verdict.verdict, "warning")
+        self.assertIn("12.0 GiB", verdict.detail)
+        self.assertIn("warning", HEALTH_VERDICTS)
+
+    def test_a_warning_with_no_detail_still_names_its_reasons(self):
+        verdict = health_verdict(
+            {"state": "warning", "last_scan_epoch": NOW,
+             "warning_reason": ["free-space-low", "store-nearly-full"]}, NOW)
+        self.assertEqual(verdict.verdict, "warning")
+        self.assertIn("store-nearly-full", verdict.detail)
+
+    def test_a_warning_with_nothing_recorded_says_so_rather_than_reading_ok(self):
+        verdict = health_verdict({"state": "warning", "last_scan_epoch": NOW}, NOW)
+        self.assertEqual(verdict.verdict, "warning")
+        self.assertEqual(verdict.detail, "reason not recorded")
+
+    def test_a_stale_warning_reports_STALE(self):
+        """A forecast from a daemon that may not be running is worth less than
+        the fact that it may not be running."""
+        verdict = health_verdict(
+            {"state": "warning", "last_scan_epoch": NOW - 9999,
+             "warning_reason": ["free-space-low"]}, NOW)
+        self.assertEqual(verdict.verdict, "stale")
+
+    def test_warning_is_never_collapsed_into_ok(self):
+        fresh_ok = health_verdict({"state": "ok", "last_scan_epoch": NOW}, NOW)
+        fresh_warning = health_verdict(
+            {"state": "warning", "last_scan_epoch": NOW,
+             "warning_reason": ["free-space-low"]}, NOW)
+        self.assertNotEqual(fresh_ok.verdict, fresh_warning.verdict)
+
+    def test_an_unknown_label_still_fails_loudly_after_the_addition(self):
+        """Adding a label must not have opened a hole for the NEXT one.
+
+        This is the direction that matters: an old helper reading a new daemon
+        says so, rather than reporting `ok` over a daemon that is about to stop.
+        """
+        for label in ("quiescing", "warn", "WARNING", "ok-ish", "", None):
+            verdict = health_verdict({"state": label, "last_scan_epoch": NOW}, NOW)
+            self.assertEqual(verdict.verdict, "unreadable-heartbeat", repr(label))
+
+
+class ExcludeParserTests(unittest.TestCase):
+    """`etc/exclude.conf` — the one config in the tree that only SUBTRACTS.
+
+    The parser cannot express anything but a directory-name glob, which is the
+    whole of the safety argument along with the file's root-owned 0644 mode.
+    """
+
+    def test_plain_globs_parse_in_order(self):
+        globs, refusals = dhu_backup_core.parse_exclude("fixtures\nsnapshots-*\ntmp?\n")
+        self.assertEqual(globs, ("fixtures", "snapshots-*", "tmp?"))
+        self.assertEqual(refusals, ())
+
+    def test_comments_and_blank_lines_are_skipped_not_refused(self):
+        globs, refusals = dhu_backup_core.parse_exclude("# 33 GB of fixtures\n\n  \nfixtures\n")
+        self.assertEqual(globs, ("fixtures",))
+        self.assertEqual(refusals, ())
+
+    def test_a_path_shaped_line_is_refused(self):
+        globs, refusals = dhu_backup_core.parse_exclude("tests/fixtures\n")
+        self.assertEqual(globs, ())
+        self.assertEqual(refusals, (("tests/fixtures", "glob-matches-the-directory-name-only"),))
+
+    def test_traversal_and_nul_are_refused(self):
+        globs, refusals = dhu_backup_core.parse_exclude("..\n*..*\nbad\x00name\n")
+        self.assertEqual(globs, ())
+        self.assertEqual([r[1] for r in refusals],
+                         ["path-traversal-in-a-name-glob",
+                          "path-traversal-in-a-name-glob",
+                          "nul-byte"])
+
+    def test_a_wildcard_only_glob_is_refused(self):
+        """`*` names no directory: it is "stop protecting everything", spelled
+        as a rule about names. An operator who wants that removes the watch
+        root, in the one file that says what is protected."""
+        globs, refusals = dhu_backup_core.parse_exclude("*\n**\n?\n[]\n")
+        self.assertEqual(globs, ())
+        self.assertEqual(set(r[1] for r in refusals), {"empty-or-wildcard-only-glob"})
+        self.assertEqual(len(refusals), 4)
+
+    def test_a_refusal_carries_the_line_so_it_can_be_logged(self):
+        _globs, refusals = dhu_backup_core.parse_exclude("tests/fixtures\n")
+        self.assertEqual(refusals[0][0], "tests/fixtures")
+
+    def test_more_globs_than_the_cap_are_refused_not_silently_dropped(self):
+        text = "\n".join("d%d" % n for n in range(dhu_backup_core.MAX_EXCLUDE_GLOBS + 5))
+        globs, refusals = dhu_backup_core.parse_exclude(text)
+        self.assertEqual(len(globs), dhu_backup_core.MAX_EXCLUDE_GLOBS)
+        self.assertEqual(len(refusals), 5)
+        self.assertEqual(set(r[1] for r in refusals), {"too-many-globs"})
+
+    def test_a_refused_line_never_becomes_a_glob(self):
+        """The dangerous direction: a refused line silently taking effect."""
+        globs, refusals = dhu_backup_core.parse_exclude(
+            "keep-me\ntests/fixtures\n..\n*\nalso-keep\n")
+        self.assertEqual(globs, ("keep-me", "also-keep"))
+        self.assertEqual(len(refusals), 3)
+
+    def test_the_parser_returns_only_strings_and_never_a_path(self):
+        globs, _refusals = dhu_backup_core.parse_exclude("fixtures\nsnapshots-*\n")
+        for glob in globs:
+            self.assertIsInstance(glob, str)
+            self.assertNotIn("/", glob)
+
+
+class ExcludeGlobMatchTests(unittest.TestCase):
+    def test_it_matches_a_directory_name(self):
+        self.assertEqual(dhu_backup_core.exclude_glob_match("fixtures", ("fixtures",)),
+                         "fixtures")
+        self.assertEqual(dhu_backup_core.exclude_glob_match("snapshots-2026", ("snapshots-*",)),
+                         "snapshots-*")
+
+    def test_it_returns_the_glob_that_matched_so_the_log_can_name_it(self):
+        self.assertEqual(
+            dhu_backup_core.exclude_glob_match("build-cache", ("nope", "build-*", "b*")),
+            "build-*")
+
+    def test_no_globs_matches_nothing(self):
+        for name in ("fixtures", "node_modules", "src"):
+            self.assertIsNone(dhu_backup_core.exclude_glob_match(name, ()))
+            self.assertIsNone(dhu_backup_core.exclude_glob_match(name))
+
+    def test_it_is_CASE_SENSITIVE_unlike_the_vault_extension(self):
+        """The fail-safe direction is reversed, so the matcher is too.
+
+        A case-insensitive vault glob vaults MORE files and costs one `sudo`. A
+        case-insensitive exclusion excludes MORE directories and costs the
+        protection. `Fixtures` is not `fixtures`.
+        """
+        self.assertIsNone(dhu_backup_core.exclude_glob_match("Fixtures", ("fixtures",)))
+        self.assertIsNone(dhu_backup_core.exclude_glob_match("FIXTURES", ("fixtures",)))
+        self.assertEqual(dhu_backup_core.exclude_glob_match("Fixtures", ("Fixtures",)),
+                         "Fixtures")
+        # The sibling matcher, for contrast, deliberately IS case-insensitive.
+        self.assertEqual(dhu_backup_core.extra_glob_match("a/NOTES.SECRET", ("*.secret",)),
+                         "*.secret")
+
+    def test_it_never_matches_across_a_separator(self):
+        """It is handed a basename by the walk and must not behave like a path
+        matcher if it is ever handed anything else."""
+        self.assertIsNone(dhu_backup_core.exclude_glob_match("a/fixtures", ("fixtures",)))
+
+    def test_an_empty_name_matches_nothing(self):
+        self.assertIsNone(dhu_backup_core.exclude_glob_match("", ("*x*",)))
+
+    def test_the_operator_list_cannot_add_protection(self):
+        """The asymmetry, asserted rather than described.
+
+        `vault-extra.conf` ORs into a predicate and can only ADD refusals;
+        `exclude.conf` gates a descent and can only REMOVE protection. Neither
+        can do the other's job, and this is the half that would be dangerous:
+        an entry here must never make a built-in exclusion stop applying.
+        """
+        for name in sorted(dhu_backup_core.EXCLUDED_DIR_NAMES):
+            self.assertTrue(is_excluded_dir(name, "a/b/" + name), name)
+            # Naming it in exclude.conf changes nothing: still excluded.
+            self.assertIsNotNone(
+                dhu_backup_core.exclude_glob_match(name, (name,)), name)

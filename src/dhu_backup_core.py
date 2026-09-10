@@ -168,6 +168,102 @@ def is_excluded_dir(name, relpath):
     return False
 
 
+# ── etc/exclude.conf — the operator's directory-name exclusions ───────────────
+#
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │ THE ASYMMETRY, STATED WHERE THE CODE IS.                                  │
+# │                                                                           │
+# │   etc/vault-extra.conf  can only ADD protection.  Its worst outcome is a  │
+# │                         work file the owner has to `sudo cat` back.       │
+# │   etc/exclude.conf      can only REMOVE protection.  Its worst outcome is │
+# │                         a directory nobody is protecting, discovered when │
+# │                         a recovery comes back empty.                      │
+# │                                                                           │
+# │ Those are not the same risk, and this file is NOT justified by the same   │
+# │ argument the vault extension is. It is acceptable for exactly one reason: │
+# │ it is root-owned 0644 in the same etc/ as `watchlist.conf`, which already │
+# │ decides what is protected AT ALL. Anything that could write this file     │
+# │ could rewrite the watch list and un-protect everything in one line, so    │
+# │ this file adds no reach an adversary did not already have. Neither is     │
+# │ writable by the owner's account, which is the account the agent holds.    │
+# │                                                                           │
+# │ The corollary is the rule for the next change: a file that could make the │
+# │ daemon protect MORE than the watch list says, or make a vaulted path      │
+# │ READABLE, would need a different argument, and there isn't one. "The      │
+# │ operator asked for it" is not that argument — the vault split exists      │
+# │ precisely because the failure directions are not symmetric.               │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# One DIRECTORY-NAME glob per line, matched with `fnmatch` against a directory's
+# BASENAME during the walk and never against a path — the same shape as
+# `vault-extra.conf`, for the same reason: a path-shaped entry would look like
+# it constrained a location and would silently constrain nothing.
+
+EXCLUDE_FILENAME = "exclude.conf"
+MAX_EXCLUDE_GLOBS = 256
+
+
+def parse_exclude(text):
+    """Parse etc/exclude.conf into `(globs, refusals)`. PURE.
+
+    Refusals are `(line, reason)` — the shape `parse_watchlist` and
+    `parse_vault_extra` use — and the caller must report them. A refused line is
+    never dropped silently. That matters MORE here than it does for the vault
+    extension: an operator who believes a directory is being skipped and is
+    wrong pays in disk, while an operator who believes a line is in force when
+    it is not simply keeps the protection they already had. Both are reported,
+    because "the rule is refused" and "the rule is working" are different facts
+    either way.
+    """
+    globs = []
+    refusals = []
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\x00" in line:
+            refusals.append((line.replace("\x00", "<NUL>"), "nul-byte"))
+            continue
+        if "/" in line:
+            refusals.append((line, "glob-matches-the-directory-name-only"))
+            continue
+        if ".." in line:
+            refusals.append((line, "path-traversal-in-a-name-glob"))
+            continue
+        if line.strip("*?[]!-") == "":
+            # A pattern made only of wildcards names no directory: it is an
+            # instruction to stop protecting EVERYTHING, spelled as a rule about
+            # names. An operator who wants that removes the watch root, which
+            # says so plainly in the one file that decides what is protected.
+            refusals.append((line, "empty-or-wildcard-only-glob"))
+            continue
+        if len(globs) >= MAX_EXCLUDE_GLOBS:
+            refusals.append((line, "too-many-globs"))
+            continue
+        globs.append(line)
+    return tuple(globs), tuple(refusals)
+
+
+def exclude_glob_match(name, exclude_globs=()):
+    """The first operator glob that excludes this DIRECTORY NAME, or None. PURE.
+
+    `name` is a basename — never a path. The caller is the walk, which has the
+    entry's own name in hand and has not resolved anything (C8).
+
+    CASE-SENSITIVE, and deliberately the opposite of `extra_glob_match`. There,
+    a case-insensitive match vaults MORE files, and every error in that
+    direction costs one `sudo`. Here, a case-insensitive match excludes MORE
+    directories, and every error in that direction is a directory nobody is
+    protecting. The fail-safe direction is reversed, so the matcher is too.
+    """
+    if not exclude_globs or not name:
+        return None
+    for glob in exclude_globs:
+        if fnmatch.fnmatchcase(name, glob):
+            return glob
+    return None
+
+
 # ── The credential predicate (amendment A2) ───────────────────────────────────
 #
 # C4 (the store laundering `.env.local` past the basename guards) is closed at
@@ -559,6 +655,115 @@ def budget_decision(store_bytes, free_bytes, incoming_bytes, limits=DEFAULT_LIMI
     return Allow()
 
 
+# ── The warning band, BEFORE the stop ────────────────────────────────────────
+#
+# `budget_decision` answers "may this write happen". It has exactly two answers
+# and neither of them is "not for much longer". Capture ENDING is designed for
+# — DEGRADED never self-heals, and that is the guarantee, not a defect — but
+# capture ending with NO NOTICE is the defect, and it was live: a volume at 99%
+# with 16.1 GiB free against a 10 GiB floor reported `ok` right up to the cycle
+# that stopped it, and `degraded` for ever after.
+#
+# So the warning is a STATE, not an annotation on `ok`. `ok` means "capturing,
+# comfortably". `warning` means "capturing, but about to stop". A reader that
+# cannot tell those apart has to guess, and the whole point of this file is that
+# no reader ever guesses.
+#
+# Both thresholds are NAMED CONSTANTS. A literal in a branch is a number nobody
+# can find from the heartbeat that reports it.
+
+#: Warn while free space is inside this multiple of the floor — i.e. less than
+#: half the floor again as headroom. At the 15 s interval and the 1 MiB file
+#: cap, half of a 10 GiB floor is thousands of cycles of notice.
+FREE_SPACE_WARNING_MULTIPLIER = 1.5
+
+#: Warn once the store has used this fraction of its ceiling.
+STORE_WARNING_FRACTION = 0.8
+
+#: Every reason `budget_warning` can report, in the order it reports them. The
+#: order is fixed here rather than emerging from dict iteration so that two
+#: heartbeats describing the same condition are byte-identical.
+WARNING_REASONS = ("free-space-low", "store-nearly-full")
+
+#: `reasons` is a TUPLE, never a single string, because both triggers can be
+#: true at once. A single-string field would force either a lossy choice
+#: between two live facts or a joined string no reader can parse.
+BudgetWarning = namedtuple("BudgetWarning", "reasons detail")
+
+
+def budget_warning(store_bytes, free_bytes, limits=DEFAULT_LIMITS):
+    """`BudgetWarning(reasons, detail)` or None — "capturing, but about to stop".
+
+    PURE. Not a gate: nothing consults this to decide whether to write. It
+    describes how close the two store-wide budgets are, for the heartbeat.
+
+    **It NEVER describes a condition that is already a stop.** That is enforced
+    structurally by the first two lines rather than by matching thresholds by
+    hand: if `budget_decision` would degrade at this store size and free space,
+    the thing to report is the stop, and `budget_warning` returns None. Keeping
+    the two in sync arithmetically would be a rule someone has to remember every
+    time a threshold moves; deferring to the real decision function is a
+    property. `test_a_warning_is_never_also_a_stop` asserts it over a grid.
+
+    `free_bytes` may be None, meaning "not measured this cycle". That produces
+    no free-space warning, because inventing a warning from a number we do not
+    have is the fabricated-reason defect this daemon already shipped once — a
+    failed `statvfs` became `free_bytes = 0`, which became a permanent
+    "the volume is full" printed beside a heartbeat reporting 30 GB free. A
+    failed measurement is reported by the daemon on its own path, as itself.
+    """
+    # "Is this already a stop?", asked of the real decision function rather than
+    # re-derived. When free space was not measured, the floor is asked about a
+    # value that is definitionally not a stop (the floor itself), so this tests
+    # the store dimension alone. That is not a fabricated report — nothing here
+    # is ever written to the heartbeat; it is the argument that isolates the one
+    # question we can still answer.
+    probe_free = limits.min_free_bytes if free_bytes is None else free_bytes
+    if isinstance(budget_decision(store_bytes, probe_free, 0, limits), Degraded):
+        return None
+
+    reasons = []
+    sentences = []
+    if free_bytes is not None:
+        threshold = int(limits.min_free_bytes * FREE_SPACE_WARNING_MULTIPLIER)
+        if free_bytes < threshold:
+            reasons.append("free-space-low")
+            sentences.append(
+                "%s free, and capture stops at %s"
+                % (_human_bytes(free_bytes), _human_bytes(limits.min_free_bytes))
+            )
+    store_threshold = int(limits.max_store_bytes * STORE_WARNING_FRACTION)
+    if store_bytes > store_threshold:
+        reasons.append("store-nearly-full")
+        sentences.append(
+            "the store holds %s of its %s ceiling"
+            % (_human_bytes(store_bytes), _human_bytes(limits.max_store_bytes))
+        )
+    if not reasons:
+        return None
+    # Reported in WARNING_REASONS order, both of them when both fire.
+    ordered = tuple(r for r in WARNING_REASONS if r in reasons)
+    return BudgetWarning(
+        reasons=ordered,
+        detail="capture is still running but close to stopping: " + "; ".join(sentences),
+    )
+
+
+def _human_bytes(byte_count):
+    """A byte count as a sentence fragment. Never used for a decision.
+
+    Scaled rather than fixed at GiB. A staging run with a fabricated 1,100-byte
+    ceiling printed "the store holds 0.0 GiB of its 0.0 GiB ceiling", which is a
+    sentence that reports nothing — and an operator who sets a small budget on
+    purpose is exactly the operator reading this line.
+    """
+    count = float(byte_count)
+    for unit, size in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
+        if count >= size:
+            return "%.1f %s" % (count / size, unit)
+    return "%d bytes" % int(byte_count)
+
+
 def entry_budget_decision(incoming_bytes, new_files_this_scan, limits=DEFAULT_LIMITS):
     """Allow() or Skip(reason) — the PER-ENTRY gate. Never degrades the daemon.
 
@@ -945,6 +1150,7 @@ STALE_SECONDS = 300
 #: a REPORT, not a silent fallback to `ok`.
 HEALTH_VERDICTS = (
     "ok",                     # the daemon scanned within STALE_SECONDS
+    "warning",                # scanning, and close to a budget that will stop it
     "degraded",               # a store-wide budget stopped capture
     "unprotected",            # healthy daemon, no usable watch root
     "scan-failed",            # every scan is throwing
@@ -1011,6 +1217,14 @@ def health_verdict(state, now_epoch, error_kind=None, error_detail=None):
     `ok`. A newer daemon writing a label this helper does not know is a status
     this helper genuinely cannot interpret, and reporting it as healthy would be
     the exact silent fallback the rest of this file exists to avoid.
+
+    That rule is what makes adding a label — `warning` was added after `ok`,
+    `degraded`, `unprotected` and `scan-failed` shipped — SAFE in the only
+    direction that matters. An old helper reading a new daemon says "heartbeat
+    state is 'warning', which this version does not understand" and fails
+    loudly; it never says `ok` over a daemon that is about to stop. The failure
+    directions are not symmetric and this is the survivable one: a mismatched
+    pair reports a mismatch, and the human upgrades the helper.
     """
     if error_kind == "missing":
         return Health("no-heartbeat", error_detail or "no heartbeat file")
@@ -1029,11 +1243,18 @@ def health_verdict(state, now_epoch, error_kind=None, error_detail=None):
         return Health("unprotected", "the daemon has no usable watch root")
     if label == "scan-failed":
         return Health("scan-failed", str(state.get("scan_error") or "reason not recorded"))
-    if label != "ok":
+    if label not in ("ok", "warning"):
         return Health("unreadable-heartbeat",
                       "heartbeat state is %r, which this version does not understand"
                       % (label,))
 
+    # `warning` shares `ok`'s freshness path, and STALENESS WINS. Both labels
+    # are claims about a daemon that is currently capturing, so both are only
+    # worth anything if the heartbeat is current. "The last capture was two days
+    # ago" supersedes "capture is close to a budget": the second is a forecast
+    # about a process that may not be running. The three terminal labels above
+    # skip this check because they report a condition that is true whether or
+    # not the daemon is still turning.
     raw = state.get("last_scan_epoch")
     try:
         last = int(raw)
@@ -1042,7 +1263,19 @@ def health_verdict(state, now_epoch, error_kind=None, error_detail=None):
     age = int(now_epoch) - last
     if age > STALE_SECONDS:
         return Health("stale", "the last capture was %ds ago" % age)
+    if label == "warning":
+        return Health("warning", str(state.get("warning_detail")
+                                     or _warning_reason_text(state)
+                                     or "reason not recorded"))
     return Health("ok", "the last capture was %ds ago" % age)
+
+
+def _warning_reason_text(state):
+    """`warning_reason` as a sentence fragment, for a heartbeat with no detail."""
+    reason = state.get("warning_reason")
+    if isinstance(reason, (list, tuple)):
+        return ", ".join(str(item) for item in reason) or None
+    return str(reason) if reason else None
 
 
 def locate_in_roots(abs_path, roots):

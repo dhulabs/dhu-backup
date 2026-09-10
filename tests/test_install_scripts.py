@@ -1223,3 +1223,172 @@ class ExampleWatchlistTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallStateVerdictTest(unittest.TestCase):
+    """What the installer does with the heartbeat the daemon just wrote.
+
+    Extracted from the post-install block into a pure bash function for exactly
+    the reason the Python decision functions are pure: the block itself needs a
+    real install, a real daemon and a real heartbeat to reach, and a guard that
+    can only be tested that way is a guard that is tested rarely.
+    """
+
+    def verdict(self, label):
+        code, out = call_function(INSTALL, "install_state_verdict", label)
+        self.assertEqual(code, 0, out)
+        return out.strip()
+
+    def test_ok_is_ok(self):
+        self.assertEqual(self.verdict("ok"), "ok")
+
+    def test_warning_is_ACCEPTED_and_is_not_ok(self):
+        """A fresh install on a nearly-full volume works, and must say so.
+
+        Accepted, because refusing to finish an install that is working leaves a
+        human deciding whether a failed installer installed anything. NOT `ok`,
+        because the caller must print something other than the OK line.
+        """
+        self.assertEqual(self.verdict("warning"), "warning")
+        self.assertNotEqual(self.verdict("warning"), self.verdict("ok"))
+
+    def test_every_failing_state_the_daemon_can_write_is_a_failure(self):
+        for label in ("degraded", "unprotected", "scan-failed"):
+            self.assertEqual(self.verdict(label), "fail", label)
+
+    def test_a_label_this_script_does_not_know_is_a_failure_not_an_ok(self):
+        """The same rule the Python `health_verdict` follows, in the shell."""
+        for label in ("quiescing", "warn", "WARNING", "OK", "", "ok ", "okay"):
+            self.assertEqual(self.verdict(label), "fail", repr(label))
+
+    def test_a_missing_argument_is_a_failure(self):
+        code, out = run_bash(["-c",
+                              'DHU_BACKUP_SOURCE_ONLY=1 . "$1" || exit 99\n'
+                              'install_state_verdict\n', "_", INSTALL])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.strip(), "fail")
+
+    def test_the_verdict_has_exactly_three_outcomes(self):
+        """A fourth would be a caller branch nobody wrote."""
+        seen = set(self.verdict(label) for label in
+                   ["ok", "warning", "degraded", "unprotected", "scan-failed",
+                    "stale", "", "nonsense"])
+        self.assertEqual(seen, {"ok", "warning", "fail"})
+
+
+class InstallWarningBannerTest(unittest.TestCase):
+    """The post-install block, read as source: which line each verdict prints."""
+
+    def setUp(self):
+        with open(INSTALL) as handle:
+            self.source = handle.read()
+
+    def test_the_bare_OK_line_is_printed_only_on_the_ok_branch(self):
+        """"OK — the daemon is running and protecting the roots above" over a
+        volume that will stop capture next week is the silent success this
+        section exists to prevent."""
+        block = self.source[self.source.index("STATE_VERDICT=$(install_state_verdict"):]
+        block = block[:block.index("\n  fi\n")]
+        warning_branch = block.index('if [ "$STATE_VERDICT" = "warning" ]')
+        else_branch = block.index("\n    else\n", warning_branch)
+        ok_line = block.index('echo "OK — the daemon is running')
+        self.assertGreater(ok_line, else_branch,
+                           "the OK line is reachable on the warning branch")
+        self.assertLess(warning_branch, ok_line)
+
+    def test_the_warning_branch_says_what_to_do_and_how_to_restart(self):
+        self.assertIn("INSTALLED AND CAPTURING — BUT CAPTURE WILL STOP.", self.source)
+        self.assertIn("min_free_bytes, max_store_bytes", self.source)
+        self.assertIn("$(service_restart_hint)", self.source)
+
+    def test_the_restart_hint_is_right_on_both_platforms(self):
+        for platform, expected in (("darwin", "launchctl kickstart -k system/com.dhulabs.backup"),
+                                   ("linux", "systemctl restart dhu-backupd.service")):
+            code, out = call_snippet(
+                INSTALL, 'set_platform "$1" >/dev/null; service_restart_hint', platform)
+            self.assertEqual(code, 0, out)
+            self.assertIn(expected, out)
+
+    def test_the_state_label_sed_matches_the_shape_the_daemon_writes(self):
+        """The installer parses `state.json` with `sed`, so the two have to agree
+        about the shape. Asserted against a heartbeat in the daemon's own format
+        (`json.dumps(..., indent=2, sort_keys=True)`), not a hand-typed line."""
+        import json as _json
+        base = tempfile.mkdtemp(prefix="dhu-state-shape-")
+        self.addCleanup(shutil.rmtree, base, True)
+        for label in ("ok", "warning", "degraded"):
+            path = os.path.join(base, "state.json")
+            with open(path, "w") as handle:
+                handle.write(_json.dumps(
+                    {"state": label, "last_scan_epoch": 1788295267,
+                     "warning_reason": ["free-space-low"],
+                     "warning_detail": "12.0 GiB free, and capture stops at 10.0 GiB",
+                     "watch_roots": 2, "watch_roots_refused": 0},
+                    indent=2, sort_keys=True) + "\n")
+            code, out = run_bash([
+                "-c",
+                r'''sed -n 's/.*"state": *"\([a-z-]*\)".*/\1/p' "$1" | head -1''',
+                "_", path])
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out.strip(), label)
+
+    def test_the_warning_detail_sed_extracts_the_sentence(self):
+        base = tempfile.mkdtemp(prefix="dhu-detail-shape-")
+        self.addCleanup(shutil.rmtree, base, True)
+        path = os.path.join(base, "state.json")
+        with open(path, "w") as handle:
+            handle.write('{\n  "state": "warning",\n'
+                         '  "warning_detail": "12.0 GiB free, and capture stops at 10.0 GiB"\n}\n')
+        code, out = run_bash([
+            "-c", r'''sed -n 's/.*"warning_detail": *"\([^"]*\)".*/\1/p' "$1" | head -1''',
+            "_", path])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.strip(), "12.0 GiB free, and capture stops at 10.0 GiB")
+
+
+class ExcludeConfGuidanceTest(unittest.TestCase):
+    """`etc/exclude.conf` is DOCUMENTED by the installer and never created by it."""
+
+    def setUp(self):
+        with open(INSTALL) as handle:
+            self.source = handle.read()
+
+    def test_the_installer_never_writes_the_file(self):
+        """An example file in etc/ goes live the moment someone uncomments a
+        line, and every line in this one removes protection."""
+        for line in self.source.splitlines():
+            if "exclude.conf" not in line:
+                continue
+            stripped = line.strip()
+            # Only ever mentioned inside an echo, a comment, or the guidance.
+            self.assertFalse(stripped.startswith("install "), line)
+            self.assertFalse(stripped.startswith("cat >"), line)
+            self.assertFalse(stripped.startswith("tee "), line)
+        self.assertNotIn("exclude.conf", INSTALL_FILES_TABLE(self.source))
+
+    def test_the_guidance_names_the_asymmetry_and_the_restart(self):
+        block = self.source[self.source.index("skip a large directory inside a watch root"):]
+        block = block[:block.index("check on it later")]
+        self.assertIn("DIRECTORY-NAME glob per line", block)
+        self.assertIn("can only ADD protection", block)
+        self.assertIn("can only REMOVE it", block)
+        self.assertIn("root-owned 0644", block)
+        self.assertIn("$(service_restart_hint)", block)
+        self.assertIn("exclude_globs", block)
+        self.assertIn("walk-excluded-dir-operator", block)
+
+    def test_it_sits_beside_the_vault_extra_guidance(self):
+        self.assertLess(self.source.index("vault extra files beyond"),
+                        self.source.index("skip a large directory inside a watch root"))
+
+    def test_the_dry_run_plan_does_not_mention_creating_it(self):
+        code, out = run_bash([INSTALL, "--dry-run", "--watch", "demo=/tmp/demo",
+                              "--owner-uid", "501"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("exclude.conf", out)
+
+
+def INSTALL_FILES_TABLE(source):
+    """The `INSTALL_FILES` table — the only list of things a run writes."""
+    start = source.index("INSTALL_FILES=\"")
+    return source[start:source.index("\"\n", start + 16)]

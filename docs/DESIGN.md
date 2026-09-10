@@ -245,6 +245,41 @@ capture makes that worse, not better: a loop rewriting one file produces a
 version per save. The budgets are the answer, and the failure shape matters more
 than the exact numbers.
 
+### A warning is a STATE, not an annotation on `ok`
+
+The two store-wide budgets end capture. That is the design, and DEGRADED never
+self-healing is the guarantee rather than a defect. Capture ending with no
+notice is the defect, and it was live: the volume this was written on sat at
+14.1 GiB free against a 10 GiB floor, reporting `ok`, and would have reported
+`ok` until the cycle that stopped it and `degraded` for ever after.
+
+The fix could have been a field — `ok` plus a `close_to_budget: true` flag. It
+is a state instead, for the reason the rest of this design keeps reaching for:
+a reader that has to remember to check a second field is a reader that reports
+`ok`. `ok` now means "capturing, comfortably" and `warning` means "capturing,
+but about to stop", and no code path can produce one while meaning the other.
+
+`budget_warning` is a pure function beside `budget_decision`, and the
+relationship between them is structural rather than arithmetic. It asks
+`budget_decision` whether this store size and free space are ALREADY a stop and
+returns None if they are, so the two can never describe the same condition
+twice. Keeping two sets of thresholds in sync by hand would be a rule someone
+has to remember every time one of them moves; deferring to the real decision
+function is a property, and the property is asserted over a fabricated grid.
+
+It is not a gate. Nothing consults it to decide whether to write, and it returns
+a record or None rather than any of the verdict types, so it cannot be dropped
+into a decision site by accident. It is a REPORT, which is the half of the
+guarantee this project keeps finding it had underbuilt.
+
+Two consequences worth stating. An unrecognised heartbeat label is
+`unreadable-heartbeat` and never `ok`, which is what made adding a fifth state
+safe: an old helper reading a new daemon fails loudly rather than reporting
+health it cannot interpret. And the installer ACCEPTS `warning` rather than
+exiting 1 on it, because a fresh install on a nearly-full volume is working, and
+refusing to finish an install that works teaches people to ignore the exit code
+— but it prints the warning in place of the OK line, never beside it.
+
 ### DEGRADED never self-heals
 
 "Store full, prune the oldest to make room" is the tempting behaviour and it is
@@ -286,12 +321,63 @@ deletes the only copy of a stable file — one written 31 days ago and never
 touched has exactly one version — so the guarantee would invert for precisely
 the files most worth keeping. **The newest version of a path is never pruned.**
 
+## Why an exclusion list is acceptable and a "make this readable" file is not
+
+`EXCLUDED_DIR_NAMES` is a literal, for the reason above: running `git` as root
+inside an agent-writable repo executes agent-controllable hooks. But an operator
+with their own multi-gigabyte directory inside a watch root had no way to skip
+it, and the answer to that is `etc/exclude.conf` — one directory-name glob per
+line, matched on the basename during the walk.
+
+This is the first config in the tree that can only REMOVE protection, and it
+needs its own argument rather than inheriting `vault-extra.conf`'s. That file
+ORs into a predicate and can only ADD refusals; the type cannot express
+"un-vault this", so no value of it makes a path readable which the patterns
+refuse. `exclude.conf` has no such comfort: every line in it is protection
+switched off.
+
+What makes it acceptable is not that the operator asked for it. It is that the
+file is root-owned 0644 in the same `etc/` as `watchlist.conf`, which already
+decides what is protected AT ALL. Anything that could write `exclude.conf` could
+rewrite the watch list and un-protect everything in one line, so the new file
+adds no reach an adversary did not already have — and neither is writable by the
+owner's account, which is the account the adversary holds. The reach is
+unchanged; only the ergonomics are new.
+
+The same argument is what REFUSES the file people ask for next. A "make this
+path readable" file — an un-vault list, a rule that moves a credential-class
+path from `vault/` to `store/` — would add reach that no existing root-owned
+file has. Nothing an operator can write today can make a secret agent-readable,
+and the split store's whole value is that the failure directions are not
+symmetric: a work file wrongly vaulted costs one `sudo`, a secret wrongly placed
+in `store/` is unrecoverable. "The operator asked for it" does not close that
+gap, because the operator is not the adversary the file would arm.
+
+Three details follow from "only ever removes". The match is CASE-SENSITIVE,
+deliberately the opposite of the vault extension's, because a loose match there
+protects more and a loose match here protects less. It lives in the WALK and not
+in `classify_entry`, because saving the descent is the entire point and because
+a path reaching admission from anywhere else should be admitted rather than
+excluded. And a wildcard-only line is refused: `*` names no directory in
+particular, it is "stop protecting everything" spelled as a rule about names,
+and an operator who wants that removes the watch root in the file that says what
+is protected.
+
+Directories skipped by an operator glob are counted under
+`walk-excluded-dir-operator`, distinct from the built-in `walk-excluded-dir`.
+Merged, an operator could not tell "my rule is working" from "my rule never
+matched" — and this project's recurring failure is exactly that shape, a status
+that cannot distinguish reported from missing.
+
 ## Reporting is part of the guarantee
 
 `var/state.json` carries counts and states and **never a path**, so it is safe
-to read anywhere. `state` is one of four:
+to read anywhere. `state` is one of five:
 
-- **ok**
+- **ok** — capturing, comfortably
+- **warning** — capturing normally, and close to a store-wide budget that will
+  stop it. Never merged into `ok`, and ordered below the three failures below:
+  a daemon that has stopped is not "about to stop"
 - **degraded** — a store-wide budget stopped capture
 - **unprotected** — the daemon is healthy and has no usable watch root, so
   nothing is being protected

@@ -211,7 +211,18 @@ def print_health_banner(install_root):
     elif label == "scan-failed":
         print("!! EVERY CAPTURE IS FAILING (%s)." % state.get("scan_error", "reason not recorded"))
     elif age > 300:
+        # Checked BEFORE `warning`, and the same way round in `health_verdict`:
+        # "the last capture was two days ago" supersedes a forecast about a
+        # daemon that may not be running at all.
         print("!! STALE — the last capture was %ds ago; the daemon may not be running." % age)
+    elif label == "warning":
+        # Said in full, not softened. This is the one banner printed while
+        # everything still works, and it is the whole point of the state: an
+        # operator who reads "capture will stop" a week early can free space,
+        # and one who reads `ok` until the day it stops cannot.
+        print("!! CAPTURE WILL STOP (%s) — %s"
+              % (",".join(state.get("warning_reason") or ["reason not recorded"]),
+                 state.get("warning_detail", "no detail recorded")))
 
 
 def health_object(install_root):

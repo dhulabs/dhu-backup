@@ -352,6 +352,8 @@ The same layout on both platforms; only the root differs
                                             written from install.sh's --watch flags
   etc/vault-extra.conf    0644 root:wheel   OPTIONAL, operator-created: extra
                                             basename globs that ADD to the vault
+  etc/exclude.conf        0644 root:wheel   OPTIONAL, operator-created: directory
+                                            -name globs that REMOVE protection
   store/                  0755 root:wheel   AGENT-READABLE — guard-clean files
   vault/                  0700 root:wheel   root-only — credential-class files
   var/roots/              0755 root:wheel   which absolute path each root-id/slug is
@@ -422,6 +424,21 @@ The disk argument is unchanged by this: a path is still bounded at
 practice), and the store ceiling plus the free-space floor remain the store-wide
 stops. Rolling changes WHICH versions a busy path keeps, not how many.
 
+**The warning band, before the stop.** The two store-wide budgets get a state of
+their own on the way down. While free space is inside `1.5 x min_free_bytes`, or
+the store is above 80% of `max_store_bytes`, the daemon writes `state: warning`
+and keeps capturing exactly as before. Both thresholds are named constants in
+`dhu_backup_core.py` (`FREE_SPACE_WARNING_MULTIPLIER`, `STORE_WARNING_FRACTION`),
+and both triggers are reported together when both are true.
+
+This exists because capture ENDING is designed for and capture ending with no
+notice is not. On the volume this was written on, 14.1 GiB free against a 10 GiB
+floor read `ok` right up to the cycle that would have stopped it. The heartbeat
+now carries `warning_reason` (a list) and `warning_detail` (a sentence), and the
+warning is logged when it ARRIVES and when it clears, not every cycle — one line
+per 15 s scan is 5,760 a day into a root-owned log on the volume the warning is
+about.
+
 **DEGRADED never self-heals.** "Store full, prune the oldest to make room" would
 quietly convert a 30-day guarantee into a best-effort cache whose only symptom is
 a file that is not there when you need it. The daemon stops, says so every
@@ -430,6 +447,69 @@ cycle, and waits for a human. It stays degraded across restarts.
 To recover from degraded: free space or raise the budget in
 `etc/dhu-backupd.conf`, delete `var/state.json`, then
 `sudo launchctl kickstart -k system/com.dhulabs.backup`.
+
+## `etc/exclude.conf` — the operator's directory exclusions
+
+Optional and never shipped: the installer prints how to create it and installs
+nothing. One DIRECTORY-NAME glob per line, `#` comments, `fnmatch` on the
+directory's basename during the walk and never against a path.
+
+```
+# /Library/DHU/backup/etc/exclude.conf
+fixtures
+snapshots-*
+```
+
+**Read the asymmetry before you use it.** `vault-extra.conf` can only ADD
+protection; its worst outcome is a work file you have to `sudo cat` back.
+`exclude.conf` can only REMOVE protection; its worst outcome is a directory
+nobody is protecting, discovered when a recovery comes back empty. Those are not
+the same risk, and this file is not justified by the same argument.
+
+It is acceptable for exactly one reason: it is root-owned 0644 in the same
+`etc/` as `watchlist.conf`, which already decides what is protected at all.
+Anything that could write this file could rewrite the watch list and un-protect
+everything in one line, so it adds no reach an adversary did not already have,
+and neither file is writable by the owner's account — the account the agent
+holds. A file that could make the daemon protect MORE than the watch list says,
+or make a vaulted path readable, would need a different argument and there is
+not one.
+
+Three details that follow from "only ever removes":
+
+* **It is matched CASE-SENSITIVELY**, deliberately the opposite of
+  `vault-extra.conf`. There, a loose match vaults a file that need not have
+  been and costs one `sudo`. Here, a loose match un-protects a directory nobody
+  named. `Fixtures` is not `fixtures`.
+* **It is a WALK rule, not an admission rule.** The whole value of it is that a
+  33 GB directory costs one `scandir` entry instead of a descent. `classify_entry`
+  keeps its own copy of the BUILT-IN list and does not know about this one; a
+  path reaching admission from anywhere else is admitted rather than excluded,
+  which is the direction that protects more.
+* **It cannot switch a built-in exclusion off.** There is no syntax for "walk
+  `node_modules` after all". The built-in list is checked first.
+
+A line containing `/`, `..`, a NUL byte, nothing but wildcards, or more than 256
+globs is REFUSED, logged as an ERROR, and counted. A wildcard-only line such as
+`*` is refused rather than obeyed: it names no directory in particular, it is
+"stop protecting everything" spelled as a rule about names, and an operator who
+wants that removes the watch root in the file that says what is protected. An
+unreadable file is a REFUSAL, not an empty list — "I could not read your rules"
+and "you have no rules" are different facts.
+
+The daemon reads it at startup from the same root-owned `etc/` as its other
+config; restart the daemon after editing it. Three heartbeat numbers report it,
+and the third is the one that says the rule is doing something:
+
+```
+"exclude_globs": 2, "exclude_refused": 1,
+"refusals_by_reason": { "walk-excluded-dir-operator": 4, "walk-excluded-dir": 11 }
+```
+
+`walk-excluded-dir-operator` is deliberately distinct from the built-in
+`walk-excluded-dir`. Merged, an operator could not tell "my rule is working"
+from "my rule never matched", and the second is the one that costs them the disk
+they were trying to save.
 
 ## Reading state.json
 
@@ -462,13 +542,27 @@ accelerator and fall back to the floor sweep. `interpreter_root_owned` false
 means the bytes this root daemon executes are replaceable by the owner's own
 account, which is the threat model inverted (review H2).
 
-`state` is one of four: **ok**, **degraded** (a store-wide budget stopped it),
-**unprotected** (the daemon is healthy and has NO usable watch root, so nothing
-is being protected — an unreadable watchlist, a refused root, or an `owner_uid`
-that does not match yours), and **scan-failed** (the daemon is running and every
-scan is throwing, with `scan_error` naming it). The first version wrote `ok` for
-the last two, with a zero file count, and a status banner reading it then said
-"protecting uncommitted work" over an empty store.
+`state` is one of five: **ok** (capturing comfortably), **warning** (capturing
+NORMALLY, and close to a store-wide budget that will stop it), **degraded** (a
+store-wide budget stopped it), **unprotected** (the daemon is healthy and has NO
+usable watch root, so nothing is being protected — an unreadable watchlist, a
+refused root, or an `owner_uid` that does not match yours), and **scan-failed**
+(the daemon is running and every scan is throwing, with `scan_error` naming it).
+The first version wrote `ok` for `unprotected` and `scan-failed`, with a zero
+file count, and a status banner reading it then said "protecting uncommitted
+work" over an empty store.
+
+`warning` is never merged into `ok`, and it is ordered BELOW the three failures:
+a daemon that has stopped is not "about to stop". Under `warning` the heartbeat
+also carries `warning_reason` (always a LIST, because both triggers can be true
+at once) and `warning_detail` (the sentence a human reads). `min_free_bytes` and
+`max_store_bytes` are in every heartbeat, warning or not, because "14.1 GiB
+free" is not actionable without the floor it is heading for.
+
+An unrecognised label is `unreadable-heartbeat` and never `ok`. That is what
+makes adding a state safe in the only direction that matters: an old helper
+reading a newer daemon says "heartbeat state is 'warning', which this version
+does not understand" and fails loudly.
 
 `files_pending_first_copy` is the throttle's backlog. On a cold start a working
 tree of a few thousand files leaves most of them without a copy for the first
