@@ -304,6 +304,38 @@ _ASOF = {"type": "string",
          "description": "ISO timestamp or relative age (20m, 2h, 3d); the newest "
                         "version at or before it, and nothing if none qualifies"}
 
+#: `InitializeResult.instructions` — the spec describes it as a hint a client
+#: MAY add to the model's system prompt. For this server that is Property 4 at
+#: the protocol level: the mirror announcing itself BEFORE a read fails, rather
+#: than waiting to be asked afterwards. Omitting it left the whole point of the
+#: product to be discovered.
+INSTRUCTIONS = (
+    "DHU Backup keeps an append-only mirror of the files a coding agent can "
+    "delete, written by a root daemon that agent cannot touch.\n\n"
+    "Call dhu_backup_missing FIRST whenever a file read or edit fails with "
+    "\"no such file\" \u2014 before concluding the file never existed, and before "
+    "reconstructing anything by hand. It takes the absolute path that failed "
+    "and reports whether the mirror holds versions of it, with the exact "
+    "command to read them back.\n\n"
+    "dhu_backup_ls, dhu_backup_log and dhu_backup_cat only read. "
+    "dhu_backup_restore and dhu_backup_restore_dir write files back where they "
+    "came from; restore_dir is the one to reach for when a whole directory is "
+    "gone.\n\n"
+    "Every result carries the daemon's health verdict. A status of "
+    "store-unavailable means the lookup could NOT be made, which is not the "
+    "same fact as there being no versions \u2014 never treat it as an empty result."
+)
+
+#: `Tool.outputSchema` is deliberately NOT set, and this is the recorded reason
+#: rather than an omission by default. The spec makes it a promise: "If an
+#: output schema is provided: Servers MUST provide structured results that
+#: conform to this schema." Every tool here returns a UNION of shapes — an ok
+#: payload, and several distinct failure payloads that carry `kind` and the
+#: reason — because refusing to collapse "I could not look" into "there is
+#: nothing" is the point. A schema loose enough to admit all of them validates
+#: nothing, and a schema tight enough to be useful would make the failure paths
+#: violate a MUST. Revisit if the payloads are ever narrowed.
+
 # ── tool annotations (MCP `ToolAnnotations`) ──────────────────────────────────
 #
 # All four hints are set explicitly on every tool, including the two the spec
@@ -334,6 +366,7 @@ WRITES = {"readOnlyHint": False, "destructiveHint": True,
 TOOLS = [
     {
         "name": "dhu_backup_missing",
+        "title": 'What the mirror holds for a file that is gone',
         "annotations": READ_ONLY,
         "description": "Call this when a file read fails. Given the ABSOLUTE path that "
                        "is gone, say whether the root-owned mirror holds versions of it, "
@@ -350,6 +383,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_ls",
+        "title": 'List protected paths that have versions',
         "annotations": READ_ONLY,
         "description": "Which protected paths have versions in the mirror. Optional "
                        "substring filter on the path relative to its watch root.",
@@ -363,6 +397,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_log",
+        "title": 'Version history of one path',
         "annotations": READ_ONLY,
         "description": "Every version of one path: capture time, size, content hash and "
                        "store location.",
@@ -376,6 +411,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_cat",
+        "title": 'Read one stored version',
         "annotations": READ_ONLY,
         "description": "The content of one stored version. UTF-8 when it decodes, "
                        "otherwise base64 — the `encoding` field says which.",
@@ -391,6 +427,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_restore",
+        "title": 'Restore one file',
         "annotations": WRITES,
         "description": "Write one stored version back to disk. The destination is DERIVED "
                        "from the stored path plus its watch root; `into` names an "
@@ -411,6 +448,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_restore_dir",
+        "title": 'Restore a whole directory as of a time',
         "annotations": WRITES,
         "description": "Write a whole directory back as of a time — the shape of the "
                        "incident this tool exists for. Paths with no version at or "
@@ -467,6 +505,7 @@ def handle(message, install_root):
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": VERSION},
+            "instructions": INSTRUCTIONS,
         })
     if method in ("notifications/initialized", "initialized"):
         return None

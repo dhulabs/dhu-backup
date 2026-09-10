@@ -619,6 +619,40 @@ class McpToolAnnotationTests(unittest.TestCase):
         self.mcp = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.mcp)
 
+    def test_every_tool_has_a_human_readable_title(self):
+        for tool in self.mcp.TOOLS:
+            self.assertTrue(tool.get("title"), "%s has no title" % tool["name"])
+            self.assertNotEqual(tool["title"], tool["name"])
+
+    def test_the_server_ships_instructions_that_teach_the_key_distinction(self):
+        """`InitializeResult.instructions` is Property 4 at the protocol level.
+
+        The spec describes it as a hint a client MAY put in the model's system
+        prompt, so it is the one place this server can speak BEFORE a read has
+        failed. Two things are asserted rather than left to prose drift: that it
+        names the tool to reach for, and that it carries the store-unavailable
+        distinction, which is the single misreading that would cost someone
+        recoverable work.
+        """
+        text = self.mcp.INSTRUCTIONS
+        self.assertIn("dhu_backup_missing", text)
+        self.assertIn("store-unavailable", text)
+        self.assertNotIn("no versions\" is the same", text)
+
+    def test_output_schema_is_omitted_as_a_recorded_decision(self):
+        """Absence must be a decision, not a default nobody examined.
+
+        That is the whole lesson of the annotations miss, so the omission of
+        `outputSchema` is pinned here: if a tool ever gains one, this test
+        fails and whoever added it has to confirm the MUST-conform promise
+        holds on every failure path too.
+        """
+        for tool in self.mcp.TOOLS:
+            self.assertNotIn("outputSchema", tool, tool["name"])
+        source = open(MCP).read()
+        self.assertIn("outputSchema", source,
+                      "the reason for omitting outputSchema must be written down")
+
     def test_every_tool_sets_all_four_hints_explicitly(self):
         for tool in self.mcp.TOOLS:
             annotations = tool.get("annotations")

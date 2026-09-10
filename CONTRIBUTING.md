@@ -102,6 +102,29 @@ before it writes a service file and the daemon at every start, rather than each
 spelling it out. Nothing outside the standard library and that root-owned
 directory may be imported: a dependency is a file somebody else can replace.
 
+**When you implement someone else's specification, absence is a decision.** Read
+the machine-readable schema, not the prose page, and enumerate every optional
+field on every object you emit. For each one, either set it or write down why
+the default is right — in the source, next to the thing that omits it. Some
+defaults are unsafe: the MCP tool hints `destructiveHint` and `openWorldHint`
+both default to **true**, so four strictly read-only tools here spent their
+first release advertising themselves as possibly destructive and possibly
+reaching the internet, by saying nothing at all.
+
+That is the same "no silent fallbacks" rule the daemon is held to, applied one
+layer out. It was missed because the rule was only ever aimed at shapes this
+project invented — the health verdicts, the announce statuses, the three-way
+degraded/warning/ok split were each argued over for hours — while a third-party
+protocol was treated as a transport to make work rather than a contract with
+semantics of its own. The tests covered behaviour, and the server behaved.
+
+An outside scanner found it in one automated pass, after four rounds of review
+here had not. Depth and breadth catch different defects, and neither substitutes
+for the other. Cheap external conformance checks are worth running precisely
+because they are looking for a different class of thing than the person who
+wrote the code.
+
+
 ## Scope
 
 Changes to the daemon's admission guards, the credential predicate, the budgets
