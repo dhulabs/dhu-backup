@@ -19,6 +19,8 @@ never against `/Library/DHU/backup`. Three rules it obeys:
    break it, rather than assumed from reading the code.
 """
 
+import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -590,6 +592,74 @@ class HelperCliTests(FixtureCase):
 
 
 # ── D: the MCP server over stdio ──────────────────────────────────────────────
+
+
+class McpToolAnnotationTests(unittest.TestCase):
+    """Every tool declares all four `ToolAnnotations` hints, and they are TRUE.
+
+    Found by an external MCP index, and the omission was not cosmetic. The
+    schema's defaults are `destructiveHint: true` and `openWorldHint: true`, so
+    a tool that ships no annotations advertises itself as possibly destructive
+    and possibly reaching an open world. Four of these six are strictly
+    read-only and were saying the opposite by saying nothing.
+
+    The second test is the one that matters over time. Anyone can keep a list of
+    which tools are read-only in sync with the truth for a while; this asserts
+    it against the CODE, by reading each dispatched handler's own source for a
+    call into a writing path. A handler that starts restoring files while still
+    declaring `readOnlyHint: true` fails here without anyone remembering to
+    update a list.
+    """
+
+    #: Helper entry points that write to the caller's filesystem.
+    WRITING_CALLS = ("command_restore", "command_restore_dir", "_run_capturing")
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("dhu_backup_mcp_annotations", MCP)
+        self.mcp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mcp)
+
+    def test_every_tool_sets_all_four_hints_explicitly(self):
+        for tool in self.mcp.TOOLS:
+            annotations = tool.get("annotations")
+            self.assertIsNotNone(annotations, "%s has no annotations" % tool["name"])
+            for hint in ("readOnlyHint", "destructiveHint", "idempotentHint",
+                         "openWorldHint"):
+                self.assertIn(hint, annotations, "%s is missing %s" % (tool["name"], hint))
+                self.assertIsInstance(annotations[hint], bool,
+                                      "%s.%s must be a bool" % (tool["name"], hint))
+
+    def test_a_read_only_claim_is_checked_against_the_handler_source(self):
+        for tool in self.mcp.TOOLS:
+            handler = self.mcp.DISPATCH[tool["name"]]
+            source = inspect.getsource(handler)
+            writes = [call for call in self.WRITING_CALLS if call in source]
+            claims_read_only = tool["annotations"]["readOnlyHint"]
+            if claims_read_only:
+                self.assertEqual(
+                    writes, [],
+                    "%s declares readOnlyHint=True but its handler calls %s"
+                    % (tool["name"], ", ".join(writes)))
+            else:
+                self.assertTrue(
+                    writes,
+                    "%s declares readOnlyHint=False but its handler calls no "
+                    "writing path — either the hint or the handler is wrong"
+                    % tool["name"])
+
+    def test_a_writing_tool_is_never_marked_additive_only(self):
+        """`destructiveHint: false` promises only additive updates.
+
+        Both writers accept `overwrite`, which replaces a file at the origin, so
+        the honest declaration is that they MAY be destructive. A hint a client
+        might use to decide whether to ask a human first should describe the
+        capability, not the common case.
+        """
+        for tool in self.mcp.TOOLS:
+            if not tool["annotations"]["readOnlyHint"]:
+                self.assertTrue(tool["annotations"]["destructiveHint"], tool["name"])
+            self.assertFalse(tool["annotations"]["openWorldHint"],
+                             "%s reaches only the local store" % tool["name"])
 
 
 class McpServerTests(FixtureCase):

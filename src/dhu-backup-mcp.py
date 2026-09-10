@@ -304,9 +304,37 @@ _ASOF = {"type": "string",
          "description": "ISO timestamp or relative age (20m, 2h, 3d); the newest "
                         "version at or before it, and nothing if none qualifies"}
 
+# ── tool annotations (MCP `ToolAnnotations`) ──────────────────────────────────
+#
+# All four hints are set explicitly on every tool, including the two the spec
+# calls "meaningful only when `readOnlyHint == false`". That redundancy is
+# deliberate. The schema's defaults are `destructiveHint: true` and
+# `openWorldHint: true`, so a tool that omits them is advertising itself as
+# possibly destructive and possibly reaching an open world — which was true of
+# this server's four read-only tools until an external index flagged it. A
+# client that reads `destructiveHint` without first checking `readOnlyHint`
+# then sees the wrong answer, and "the default happened to be safe" is not a
+# property worth relying on. Writing all four leaves nothing to a default.
+#
+# The spec is also explicit that a CLIENT must treat these as untrusted unless
+# the server is trusted. That is the right posture and it is the same one this
+# project takes everywhere else: these hints are a description, never a control.
+# Nothing here enforces read-onlyness — the kernel does that, by owning the
+# store, and `restore_permitted` refuses root regardless of what any hint says.
+READ_ONLY = {"readOnlyHint": True, "destructiveHint": False,
+             "idempotentHint": True, "openWorldHint": False}
+# `destructiveHint` is true for the two writers because both accept arguments
+# that can REPLACE a file at the origin (`overwrite`), even though the default
+# path writes beside a differing file rather than over it. Declaring the
+# capability rather than the common case is the honest direction for a hint a
+# client may use to decide whether to ask a human first.
+WRITES = {"readOnlyHint": False, "destructiveHint": True,
+          "idempotentHint": True, "openWorldHint": False}
+
 TOOLS = [
     {
         "name": "dhu_backup_missing",
+        "annotations": READ_ONLY,
         "description": "Call this when a file read fails. Given the ABSOLUTE path that "
                        "is gone, say whether the root-owned mirror holds versions of it, "
                        "and give the exact command to read them back. Statuses: held, "
@@ -322,6 +350,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_ls",
+        "annotations": READ_ONLY,
         "description": "Which protected paths have versions in the mirror. Optional "
                        "substring filter on the path relative to its watch root.",
         "inputSchema": {
@@ -334,6 +363,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_log",
+        "annotations": READ_ONLY,
         "description": "Every version of one path: capture time, size, content hash and "
                        "store location.",
         "inputSchema": {
@@ -346,6 +376,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_cat",
+        "annotations": READ_ONLY,
         "description": "The content of one stored version. UTF-8 when it decodes, "
                        "otherwise base64 — the `encoding` field says which.",
         "inputSchema": {
@@ -360,6 +391,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_restore",
+        "annotations": WRITES,
         "description": "Write one stored version back to disk. The destination is DERIVED "
                        "from the stored path plus its watch root; `into` names an "
                        "alternative base DIRECTORY, never a filename. Nothing is silently "
@@ -379,6 +411,7 @@ TOOLS = [
     },
     {
         "name": "dhu_backup_restore_dir",
+        "annotations": WRITES,
         "description": "Write a whole directory back as of a time — the shape of the "
                        "incident this tool exists for. Paths with no version at or "
                        "before that time are reported skipped, never silently omitted.",
