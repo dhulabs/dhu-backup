@@ -178,6 +178,37 @@ INSTALL_DIRS="
 # between launchd and systemd is readable in one screen instead of scattered
 # through the script.
 
+#: How long the installer waits for the daemon to prove itself with a NEW
+#: heartbeat. A first scan over a large watch root can exceed this, which is
+#: why timing out is reported as "not yet" and not as "did not start".
+HEARTBEAT_WAIT_SECONDS=60
+
+#: Which of two DIFFERENT facts a heartbeat timeout represents. PURE: it takes
+#: what the caller observed, so both outcomes are testable without an install.
+#:
+#: `still-scanning` — the service is loaded and has a live pid, so the daemon
+#: started and simply has not finished a first pass. `did-not-start` — it is not
+#: running. Saying the second while observing only a missing heartbeat is the
+#: silent-fallback shape this project forbids, one layer up: a report that
+#: states more than the evidence supports, and points at the wrong remedy.
+heartbeat_timeout_verdict() {  # <loaded:0|1> <pid-or-empty>
+  if [ "${1:-0}" -eq 1 ] && [ -n "${2:-}" ]; then
+    echo still-scanning
+  else
+    echo did-not-start
+  fi
+}
+
+service_main_pid() {  # echo the running main pid, or nothing
+  case "$SERVICE_KIND" in
+    launchd) launchctl print "system/$LABEL" 2>/dev/null |
+               sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1 ;;
+    systemd) local pid
+             pid=$(systemctl show -p MainPID --value "$LABEL.service" 2>/dev/null)
+             [ -n "${pid:-}" ] && [ "$pid" != "0" ] && echo "$pid" ;;
+  esac
+}
+
 service_loaded() {  # 0 if the service is currently loaded/known to the manager
   case "$SERVICE_KIND" in
     launchd) launchctl print "system/$LABEL" >/dev/null 2>&1 ;;
@@ -897,7 +928,7 @@ if [ "$NO_SERVICE" -eq 1 ]; then
   exit 0
 fi
 echo
-echo "-- waiting for a NEW heartbeat (up to 60s; the previous one was at $BEFORE_EPOCH)"
+echo "-- waiting for a NEW heartbeat (up to ${HEARTBEAT_WAIT_SECONDS}s; the previous one was at $BEFORE_EPOCH)"
 NOW_EPOCH=0
 for _ in $(seq 1 60); do
   if [ -f "$DEST/var/state.json" ]; then
@@ -957,7 +988,32 @@ if [ "$NOW_EPOCH" -gt "$BEFORE_EPOCH" ]; then
     exit 1
   fi
 else
-  echo "!! no NEW heartbeat after 60s — this daemon did not start."
+  # "No heartbeat yet" and "did not start" are DIFFERENT FACTS, and this said
+  # the second while observing only the first. Found on a real install: the
+  # daemon was running the whole time, part-way through a first scan of a
+  # 33 GB directory inside a watch root, and the operator was told it had not
+  # started. Distinguishing them here costs two checks and points at the
+  # remedy that actually applies.
+  echo "!! no NEW heartbeat within ${HEARTBEAT_WAIT_SECONDS}s."
+  RUNNING_PID=$(service_main_pid)
+  LOADED=0; service_loaded && LOADED=1
+  if [ "$(heartbeat_timeout_verdict "$LOADED" "$RUNNING_PID")" = still-scanning ]; then
+    running_pid="$RUNNING_PID"
+    echo "   The service IS loaded and running as pid $running_pid, so this is"
+    echo "   most likely a FIRST SCAN still in progress, not a failure to start."
+    echo "   A first scan walks every watched root once; a large directory"
+    echo "   inside one (a model cache, a virtualenv, a media tree) can take"
+    echo "   many minutes and holds one directory watch per subdirectory."
+    echo
+    echo "   Watch it finish:   tail -f $DEST/var/dhu-backupd.log"
+    echo "   Then confirm:      cat $DEST/var/state.json"
+    echo
+    echo "   If a large directory should not be protected at all, name it in"
+    echo "   $DEST/etc/exclude.conf (one directory-name glob per line) and"
+    echo "   restart: $(service_restart_hint)"
+    exit 1
+  fi
+  echo "   The service is NOT running, so it failed to start."
   echo "   $(service_status_hint); tail $DEST/var/dhu-backupd.log"
   exit 1
 fi

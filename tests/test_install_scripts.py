@@ -638,6 +638,47 @@ REFUSAL_SNIPPET = (
 )
 
 
+class HeartbeatTimeoutVerdictTest(unittest.TestCase):
+    """A heartbeat timeout is TWO different facts, and it used to report one.
+
+    Found on a real install: the installer waited 60s, saw no new heartbeat and
+    printed "this daemon did not start". The daemon had started and was part-way
+    through a first scan of a 33 GB directory inside a watch root. The operator
+    was told the wrong thing and pointed at the wrong remedy — the same
+    silent-fallback shape this project forbids in the daemon, one layer out: a
+    report stating more than the evidence supports.
+    """
+
+    def verdict(self, loaded, pid):
+        rc, out = call_snippet(INSTALL, 'heartbeat_timeout_verdict "$1" "$2"',
+                               str(loaded), pid)
+        self.assertEqual(rc, 0, out)
+        return out.strip()
+
+    def test_loaded_with_a_live_pid_is_a_scan_in_progress(self):
+        self.assertEqual(self.verdict(1, "4242"), "still-scanning")
+
+    def test_every_other_combination_is_a_failure_to_start(self):
+        # Loaded but no pid is the launchd shape for a job that is known and
+        # not running, so it belongs with the failures, not with the waits.
+        for loaded, pid in ((1, ""), (0, "4242"), (0, "")):
+            self.assertEqual(self.verdict(loaded, pid), "did-not-start",
+                             "loaded=%s pid=%r" % (loaded, pid))
+
+    def test_the_timeout_branch_names_the_exclusion_remedy(self):
+        """The remedy for a slow first scan is a directory the operator can skip.
+
+        Asserted because the message is the whole value of the fix: a reader who
+        is told "still scanning" and not told what to do about a directory that
+        should never have been walked is only half-served.
+        """
+        source = open(INSTALL).read()
+        branch = source[source.index("no NEW heartbeat within"):]
+        branch = branch[:branch.index("exit 1")]
+        self.assertIn("exclude.conf", branch)
+        self.assertIn("FIRST SCAN", branch)
+
+
 class UninstallWatchRootsTest(unittest.TestCase):
     """`print_watch_roots_for` — the flags that make an uninstall reversible.
 
