@@ -638,6 +638,40 @@ REFUSAL_SNIPPET = (
 )
 
 
+class DocumentedTestCountTest(unittest.TestCase):
+    """The test count printed in the docs must be the real one.
+
+    It rotted within a week: three files claimed 413 while the suite ran 521,
+    because every commit that added tests updated none of them. A number in a
+    README is a claim like any other, and an unchecked claim drifts. Checking it
+    costs one discovery pass and turns "remember to update the docs" into a
+    failing test that says which file to edit.
+    """
+
+    DOCS = ("README.md", "CONTRIBUTING.md", "docs/PROOFS.md")
+
+    def test_the_docs_state_the_number_of_tests_that_actually_run(self):
+        loader = unittest.TestLoader()
+        suite = loader.discover(os.path.dirname(os.path.abspath(__file__)), pattern="test_*.py")
+        self.assertEqual(loader.errors, [], "discovery itself failed: %s" % loader.errors)
+
+        def count(item):
+            return sum(count(child) for child in item) if hasattr(item, "__iter__") else 1
+
+        actual = count(suite)
+        for name in self.DOCS:
+            path = os.path.join(REPO_ROOT, name)
+            text = open(path).read()
+            claimed = re.findall(r"(\d{3,})[ -]test", text)
+            self.assertTrue(claimed, "%s states no test count; add one or drop it "
+                                     "from DOCS here" % name)
+            for number in claimed:
+                self.assertEqual(
+                    int(number), actual,
+                    "%s claims %s tests, the suite runs %d. Update the document."
+                    % (name, number, actual))
+
+
 class HeartbeatTimeoutVerdictTest(unittest.TestCase):
     """A heartbeat timeout is TWO different facts, and it used to report one.
 

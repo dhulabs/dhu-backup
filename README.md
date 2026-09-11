@@ -40,6 +40,11 @@ second principal, which means root, which means one deliberate install.
 
 ## Install
 
+```bash
+git clone https://github.com/dhulabs/dhu-backup.git
+cd dhu-backup
+```
+
 One sudo, once, by a human. The install root is fixed per platform; what you
 choose is which directories are watched.
 
@@ -64,6 +69,25 @@ source and destination:
 ```bash
 bash src/install.sh --dry-run --watch repo=/Users/you/Projects/my-repo
 ```
+
+**Size up your watch roots first.** The first scan walks every watched root
+once, and a large directory inside one costs real time: a model cache or a
+Python virtualenv can hold tens of thousands of files that are individually
+small enough to be admitted. Measured on a real install, one 33 GB directory
+inside a watch root took the scan from 3,500 files to 47,611, left 41,741 files
+queued behind the 2,000-per-scan throttle, and pushed each pass past a minute
+against a 15-second interval. Nothing was broken and nothing was lost — the
+daemon reports all of it — but the install's own 60-second heartbeat check timed
+out while the scan was still going.
+
+So run `du -sh *` over anything you are about to watch, and if something large
+does not need protecting, name it before you start:
+
+```bash
+printf 'my-model-cache\n' | sudo tee /opt/dhu-backup/etc/exclude.conf
+```
+
+One directory-name glob per line. See [the exclusion list](#the-exclusion-list).
 
 **Read `install.sh` before running it.** Running it with sudo is a one-time
 transfer of trust to code delivered from a directory an agent can write. There
@@ -205,6 +229,8 @@ configured uid, not setuid or setgid, at most 1 MiB, outside the excluded
 directories and extensions. No path string is ever re-resolved, so there is no
 window in which a checked name can be swapped for a symlink or a hard link.
 
+### The exclusion list
+
 The excluded directories are a built-in list — `node_modules`, `.git`, `dist`
 and the rest. An operator with a large directory of their own inside a watch
 root can add to it with an optional root-owned `etc/exclude.conf`, one
@@ -270,7 +296,7 @@ the full page.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-413 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
+522 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
 runs the same suite on `macos-latest` and `ubuntu-latest`, which is the standing
 proof that it passes on a clean machine with nothing from a developer's own.
 

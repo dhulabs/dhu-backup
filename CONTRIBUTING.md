@@ -8,7 +8,7 @@ Both platforms, the same command, the system interpreter:
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-413 tests. Green on macOS under Python 3.9 and on Ubuntu under Python 3.14. Use
+522 tests. Green on macOS under Python 3.9 and on Ubuntu under Python 3.14. Use
 `/usr/bin/python3` rather than whatever is first on `PATH`: the daemon runs
 under the system interpreter with `-E -s -S`, and a test run under a pyenv or
 homebrew Python is not testing the thing that ships.
