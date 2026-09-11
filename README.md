@@ -89,6 +89,18 @@ printf 'my-model-cache\n' | sudo tee /opt/dhu-backup/etc/exclude.conf
 
 One directory-name glob per line. See [the exclusion list](#the-exclusion-list).
 
+A real run prints that same plan and then **asks you to type `yes`** before it
+writes anything. `--yes` skips the prompt for automation; when stdin is not a
+terminal — CI, a pipe — it proceeds without asking and says in its output that
+no human confirmed the plan. The prompt is not a security control, since anyone
+typing `sudo bash install.sh` has already decided; it is what turns the plan
+from something that scrolls past into something you read.
+
+Run it with no `--watch` and it still refuses — there is no default watchlist —
+but it also prints ready-to-paste `--watch` flags for the git working trees
+it finds under your home directory, most recently modified first. It suggests;
+it never applies.
+
 **Read `install.sh` before running it.** Running it with sudo is a one-time
 transfer of trust to code delivered from a directory an agent can write. There
 is no way around that for a root daemon. The mitigations are that the script is
@@ -107,9 +119,26 @@ sudo bash src/uninstall.sh --purge --yes   # ... and delete store/, vault/, var/
 printed. An uninstaller that deletes them because you wanted to stop a daemon
 has destroyed the thing it was protecting.
 
+### Homebrew — **not yet published**
+
+A formula lives at [`packaging/homebrew/dhu-backup.rb`](packaging/homebrew/dhu-backup.rb),
+ready for the tap `dhulabs/homebrew-tap`. **That tap does not exist yet**, so
+`brew install dhulabs/tap/dhu-backup` will fail today; clone the repository as
+above instead.
+
+When it is published it will install the reader — the tree into `libexec` and
+`dhu-backup` into `bin`, so `dhu-backup status` works immediately — and it will
+**not** install, register or start the daemon. `brew` runs as you, which is the
+same principal an agent runs as, and the whole guarantee here rests on the
+mirror being written by a second principal your own processes cannot touch. A
+formula that could stand that daemon up would be a path from a package manager
+an agent can drive to root. The daemon stays one deliberate `sudo`, by a human
+who has read the script, and the formula's caveats print that exact command.
+
 ## Recover
 
 ```bash
+dhu-backup status                             # is this working? and if not, what to type
 dhu-backup ls   <path-substring>              # which protected paths have versions
 dhu-backup log  <path>                        # versions of one path: time, size, hash
 dhu-backup cat  <path> --asof 20m             # print one version to stdout
@@ -118,7 +147,17 @@ dhu-backup restore-dir <dir>  [--asof 20m]    # a deleted directory back in one 
 dhu-backup missing <ABSOLUTE path>            # what the store holds for a path that is GONE
 ```
 
-`ls`, `log` and `missing` also take `--json`.
+`status`, `ls`, `log` and `missing` also take `--json`.
+
+`status` is the everyday one. It needs no sudo and prints the health verdict and
+what it means, when the last capture was, the watch roots in force with the
+count of paths held under each, the store size and free space against the
+budgets that stop capture, and — when something is wrong — the one command that
+addresses it. Its exit code is the daemon's, not its own: **0** capturing (`ok`
+or `warning`), **1** not capturing (`degraded`, `unprotected`, `scan-failed`,
+`stale`), **2** the status could not be determined (`no-heartbeat`,
+`unreadable-heartbeat`). "Capture has stopped" and "I could not find out whether
+capture has stopped" are opposite claims and never share a code.
 
 `dhu-backup` is `/Library/DHU/backup/bin/dhu-backup` on macOS and
 `/opt/dhu-backup/bin/dhu-backup` on Linux. Call it by its full path, or put that
@@ -296,7 +335,7 @@ the full page.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-522 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
+618 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
 runs the same suite on `macos-latest` and `ubuntu-latest`, which is the standing
 proof that it passes on a clean machine with nothing from a developer's own.
 

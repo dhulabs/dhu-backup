@@ -14,8 +14,9 @@ Register it with Claude Code:
     claude mcp add dhu-backup -- /usr/bin/python3 -E -s -S \\
         /Library/DHU/backup/bin/dhu-backup-mcp
 
-Six tools, all of them the CLI's own code paths reached a different way:
+Seven tools, all of them the CLI's own code paths reached a different way:
 
+    dhu_backup_status       is the mirror capturing, and if not what to type
     dhu_backup_missing      what the store holds for a path that is GONE
     dhu_backup_ls           which protected paths have versions
     dhu_backup_log          the versions of one path
@@ -136,7 +137,7 @@ def _optional(arguments, name):
     return value
 
 
-# ── the six tools ─────────────────────────────────────────────────────────────
+# ── the seven tools ───────────────────────────────────────────────────────────
 
 
 def tool_missing(install_root, arguments):
@@ -145,6 +146,19 @@ def tool_missing(install_root, arguments):
     payload = dhu_backup_announce.to_json(result)
     payload["text"] = dhu_backup_announce.format_text(result)
     return payload, result.status == "store-unavailable"
+
+
+def tool_status(install_root, arguments):
+    """The CLI's `status`, unchanged, as a tool.
+
+    `is_error` is TRUE only when the status could not be determined (exit code
+    2). A daemon that has stopped capturing is an ANSWER — the answer the caller
+    most needs — and returning it as a protocol error would invite a client to
+    retry it or to drop it on the floor.
+    """
+    payload = helper.status_payload(install_root)
+    payload["text"] = helper.format_status(payload)
+    return payload, payload["exit_code"] == 2
 
 
 def tool_ls(install_root, arguments):
@@ -365,6 +379,19 @@ WRITES = {"readOnlyHint": False, "destructiveHint": True,
 
 TOOLS = [
     {
+        "name": "dhu_backup_status",
+        "title": 'Is the mirror capturing right now?',
+        "annotations": READ_ONLY,
+        "description": "Whether DHU Backup is capturing on this machine, and if not, the "
+                       "one command that addresses it. Reports the daemon's health "
+                       "verdict, when the last capture was, the watch roots in force "
+                       "with the count of PATHS held under each, the store size and free "
+                       "space against the budgets that stop capture, and the operator's "
+                       "exclusion and vault-extra glob counts. `exit_code` is 0 when "
+                       "capturing, 1 when not, 2 when it could not be determined.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "dhu_backup_missing",
         "title": 'What the mirror holds for a file that is gone',
         "annotations": READ_ONLY,
@@ -468,6 +495,7 @@ TOOLS = [
 ]
 
 DISPATCH = {
+    "dhu_backup_status": tool_status,
     "dhu_backup_missing": tool_missing,
     "dhu_backup_ls": tool_ls,
     "dhu_backup_log": tool_log,

@@ -26,6 +26,43 @@ its mode, source and destination:
 bash src/install.sh --dry-run --watch repo=/Users/you/Projects/my-repo
 ```
 
+**A real run asks before it writes.** It prints the plan, then requires the word
+`yes` — not a keypress, and not a default — before the first file is installed.
+The rule is one pure function over three facts, so every path is asserted
+without a terminal:
+
+| stdin | flags | what happens |
+|---|---|---|
+| anything | `--dry-run` | `skip-dry-run`: nothing is written, so there is nothing to confirm |
+| anything | `--yes` | `yes-flag`: proceeds, saying that the prompt was skipped |
+| a terminal | neither | `prompt`: type `yes`, or it aborts with nothing changed |
+| not a terminal | neither | `no-tty`: proceeds, and **says** the plan was not confirmed by a human |
+
+The last row is the one worth arguing about. Prompting would hang CI and every
+pipe, and a `yes` read off a pipe is a confirmation from whatever wrote the
+pipe, which is not a human — so it proceeds, and the transcript records that
+nobody confirmed. That fact is exactly what someone reading the transcript later
+needs.
+
+This is not a security control: anyone typing `sudo bash install.sh` has already
+made the decision, and nothing here makes handing over root any harder. It makes
+the plan something the operator confronts rather than something that scrolls
+past.
+
+**The refusal for want of `--watch` also suggests.** With no roots given and none
+installed, the installer still refuses before touching anything — a default
+watchlist stays forbidden, for the reason below — but it also prints
+ready-to-paste flags derived from this machine: git working trees at most two
+levels under the invoking user's home (`$SUDO_UID`'s, never root's), ordered
+most-recently-modified first, capped at eight, skipping anything the built-in
+exclusion list already drops, with the id derived from the directory basename
+and every path single-quoted. Symlinks are not followed, so a link inside the
+home directory cannot lead the search into another account's tree. If it finds
+nothing it says so rather than printing an empty command. It runs on the refusal
+path and under `--dry-run`, and nowhere else: a real install already knows what
+it is protecting, and a suggestion printed beside a plan about to be executed
+reads like part of it.
+
 **The install ROOT is fixed per platform** — `/Library/DHU/backup` on macOS,
 `/opt/dhu-backup` on Linux. That is the product's identity on each, and it is not
 configurable. What you choose is which directories are WATCHED:
@@ -35,6 +72,7 @@ configurable. What you choose is which directories are WATCHED:
 | `--watch <id>=<abs-path>` | one directory to protect. Repeatable. |
 | `--watchlist <file>` | the same, from a file in watchlist format. Repeatable, and combinable with `--watch`. |
 | `--owner-uid <n>` | the uid whose files are protected. Defaults to `$SUDO_UID`. |
+| `--yes` | proceed without the confirmation prompt. For automation. |
 | `--dry-run` | print the plan, change nothing, exit 0. Runs unprivileged. |
 | `--platform darwin\|linux` | print the OTHER platform's plan. **`--dry-run` only** — it changes the install root, the service manager and the service file, so a real run under it would install the wrong platform's daemon. Refused at parse time otherwise. |
 | `--no-service` | install the files and register no service. Linux only, and only where no systemd manager is running. See **Linux** below. |
@@ -576,6 +614,7 @@ installed daemon), and unreadable.
 ## Recovery — no sudo, no human, one command
 
 ```bash
+dhu-backup status                        # is this working? and if not, what to type
 dhu-backup ls   <path-substring>         # which protected paths have versions
 dhu-backup log  <path>                   # versions of one path: time, size, hash
 dhu-backup cat  <path> --asof 20m        # print one version to stdout
@@ -614,6 +653,122 @@ which half of the mirror an answer came from. `restore` and `restore-dir` refuse
 root whatever the variable says: a file they wrote would be root-owned at the
 origin, which the daemon refuses as `wrong-owner-uid`, so the recovery would
 silently un-protect the very file it recovered.
+
+### `dhu-backup status` — is this working?
+
+```bash
+dhu-backup status            # unprivileged; writes nothing
+dhu-backup status --json
+```
+
+Everything it reports was always in `var/state.json`, and reading JSON at the
+moment your work has vanished is not a recovery procedure. It prints:
+
+* the health verdict and what it means, in the SAME words a failed read uses —
+  `dhu_backup_announce.health_sentence` is the one vocabulary, and `ok` is the
+  only verdict whose sentence is not in the `_HEALTH_NOTE` table the hot path
+  shouts from;
+* when the last capture was;
+* the watch roots **in force**, read from `etc/watchlist.conf` rather than from
+  `var/roots/` — those manifests are written per expanded root and are never
+  removed, so a machine whose watchlist changed last month still has manifests
+  for directories nothing watches now. Beside each root is the count of PATHS
+  the store holds under it, and beside the list is the daemon's own count of
+  expanded roots, because one `--watch worktrees=/…/worktrees/*` line becomes
+  one root per directory and the two numbers are not substitutes;
+* a note naming any store subtree whose id the watchlist no longer mentions:
+  that history is KEPT and nothing is being added to it, which is the difference
+  between believing an old repo is still protected and knowing it is not;
+* the store size and the free space against **the daemon's own** budgets — read
+  from the heartbeat, not from the compiled-in defaults, because raising
+  `max_store_bytes` is the documented way out of `degraded` and a status that
+  ignored that would print the wrong number on exactly the machine where
+  somebody acted on the last one;
+* the operator's exclusion and vault-extra glob counts, when there are any —
+  including zero globs with refusals, which means every line the operator wrote
+  was thrown out;
+* when something is wrong, the ONE command that addresses it.
+
+The count of paths is a **path** count, not a version count: a file with 200
+versions counts once, because the number is read as "how much of my work is in
+there" and versions-per-path is a retention setting. Getting it exactly needs
+one directory open per version directory — a path's versions are siblings, so
+the only way to learn a path's name is to look inside one — so the walk has a
+budget of 20,000 opens shared across the roots, each root taking an equal share
+of what is left and handing back what it does not spend. A root whose share runs
+out reports **"at least N"** rather than a number that is quietly wrong.
+Measured on a real store of 33,000 paths and 37,425 version directories: 1.2 s
+of opens on top of a 0.6 s tree walk if uncapped, about half a second with the
+budget in force.
+
+#### Exit codes
+
+| code | meaning | verdicts |
+|---|---|---|
+| 0 | capturing | `ok`, `warning` |
+| 1 | not capturing; a human has to act | `degraded`, `unprotected`, `scan-failed`, `stale` |
+| 2 | the status could not be determined | `no-heartbeat`, `unreadable-heartbeat` |
+
+Three codes, not two, for the reason `announce_exit_code` has three: "capture
+has stopped" and "I could not find out whether capture has stopped" are opposite
+claims, and a monitor that collapses them either pages for a machine that is
+fine or stays quiet about one that is not. `warning` exits 0 because capture IS
+running — failing on it would fail over something that has not happened, and the
+operator would learn to ignore the code before the day it meant `degraded`. The
+three sets partition `HEALTH_VERDICTS`, a test asserts that they do, and a
+verdict in none of them makes `status_exit_code` raise rather than default to 0.
+
+The exit code is the DAEMON's, never the command's. `status` succeeding while
+capture has stopped is a report somebody would write a green monitor against.
+
+#### The JSON shape
+
+`--json` prints one object with these keys, and every key is present whatever
+happened — a missing field never stands in for a failure:
+
+```json
+{
+  "install_root": "/Library/DHU/backup",
+  "health": {"verdict": "ok", "detail": "the last capture was 3s ago",
+             "sentence": "OK — capture is running and the store is being written"},
+  "capturing": true,
+  "exit_code": 0,
+  "last_capture": {"epoch": 1789156046, "iso": "2026-09-11T15:47:26", "age_seconds": 3},
+  "watch_roots": {
+    "error": null, "store_error": null,
+    "configured": [{"root_id": "repo", "pattern": "/Users/you/Projects/x",
+                    "paths_held": 412, "paths_held_capped": false, "error": null}],
+    "refused_lines": [], "expanded": 35, "expanded_refused": 0,
+    "unwatched_root_ids": []
+  },
+  "store": {"bytes": 769, "human": "769 bytes", "ceiling_bytes": 5368709120,
+            "ceiling_human": "5.0 GiB", "headroom_bytes": 5368708351,
+            "headroom_human": "5.0 GiB"},
+  "free_space": {"bytes": 49123995648, "human": "45.7 GiB",
+                 "floor_bytes": 10737418240, "floor_human": "10.0 GiB",
+                 "headroom_bytes": 38386577408, "headroom_human": "35.7 GiB"},
+  "warning": null,
+  "exclusions": {"globs": 1, "refused": 0},
+  "vault_extra": null,
+  "next_step": {"sentence": null, "command": null}
+}
+```
+
+`watch_roots.error` non-null means the watchlist could not be READ, and
+`configured` is then empty — which is why the error field exists rather than an
+empty list standing for "nothing is watched". `free_space` is null when the
+daemon did not measure it this cycle, never `0`: a failed `statvfs` that became
+`free_bytes = 0` once printed a permanent "the volume is full" beside a
+heartbeat reporting 30 GB free. `exclusions` and `vault_extra` are null when the
+operator has added no rules of that kind. `warning` carries `reasons` (a list,
+because both triggers can fire at once) and `detail` only under the `warning`
+verdict.
+
+The same payload is the MCP tool `dhu_backup_status`, annotated read-only, with
+the rendered text beside it in a `text` field. A stopped daemon comes back as an
+ANSWER with `isError: false` — it is the answer the caller most needs, and a
+protocol error is something a client may retry or drop. Only exit code 2, "could
+not determine", is an error there.
 
 ## Self-announcing recovery (Property 4)
 
@@ -736,9 +891,10 @@ on the machine and report its contents back.
 claude mcp add dhu-backup -- /usr/bin/python3 -E -s -S /Library/DHU/backup/bin/dhu-backup-mcp
 ```
 
-Stdlib-only JSON-RPC 2.0 over newline-delimited stdio, MCP `2025-06-18`, six
-tools: `dhu_backup_missing`, `dhu_backup_ls`, `dhu_backup_log`, `dhu_backup_cat`,
-`dhu_backup_restore`, `dhu_backup_restore_dir`. Each returns a JSON text block
+Stdlib-only JSON-RPC 2.0 over newline-delimited stdio, MCP `2025-06-18`, seven
+tools: `dhu_backup_status`, `dhu_backup_missing`, `dhu_backup_ls`,
+`dhu_backup_log`, `dhu_backup_cat`, `dhu_backup_restore`,
+`dhu_backup_restore_dir`. Each returns a JSON text block
 plus `structuredContent`, and every result carries the daemon's health verdict.
 `dhu_backup_cat` returns UTF-8 when the content decodes and base64 otherwise,
 with an `encoding` field saying which.

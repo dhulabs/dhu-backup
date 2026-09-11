@@ -7,6 +7,8 @@
 #   --watchlist <file>        the same, read from a file in watchlist format.
 #                             Repeatable, and combinable with --watch.
 #   --owner-uid <n>           the uid whose files are protected (default $SUDO_UID).
+#   --yes                     skip the "type yes to proceed" confirmation. For
+#                             automation; a human should read the plan instead.
 #   --dry-run                 print exactly what this would do and change nothing.
 #                             Runnable without sudo.
 #   --platform darwin|linux   plan for the OTHER platform. --dry-run ONLY.
@@ -306,7 +308,7 @@ systemd_is_running() {
 usage() {
   cat >&2 <<USAGE
 usage: sudo bash install.sh [--watch <id>=<abs-path>]... [--watchlist <file>]...
-                            [--owner-uid <n>] [--dry-run]
+                            [--owner-uid <n>] [--yes] [--dry-run]
                             [--platform darwin|linux] [--no-service]
 
   --watch <id>=<abs-path>  a directory to protect; repeatable.
@@ -318,6 +320,10 @@ usage: sudo bash install.sh [--watch <id>=<abs-path>]... [--watchlist <file>]...
                            See src/watchlist.conf.example.
   --owner-uid <n>          the uid whose files are protected. Defaults to
                            \$SUDO_UID, i.e. the human who typed sudo.
+  --yes                    proceed without the confirmation prompt. A real run
+                           prints its plan and then asks for the word 'yes'
+                           before anything is written, when stdin is a terminal.
+                           This skips that, for automation.
   --dry-run                print the plan and exit 0 without changing anything.
   --platform darwin|linux  print the plan for the OTHER platform. Accepted ONLY
                            together with --dry-run: it changes the install root,
@@ -498,6 +504,256 @@ watchlist_decision() {  # <flags-given:0|1> <existing:0|1>
   fi
 }
 
+# ── the confirmation step ─────────────────────────────────────────────────────
+#
+# The plan was always printed and the install always proceeded, so on a fast
+# terminal the plan scrolled past and the first thing the operator read was the
+# post-conditions. This is not a security control — anyone who types
+# `sudo bash install.sh` has already decided — it is what turns the plan from
+# something that scrolls past into something they confront. It is also NOT a
+# shortcut past the decision: there is no "press enter", the word is `yes`, and
+# `--yes` has to be typed on purpose.
+#
+# PURE, over the three facts that decide it, so every combination is testable
+# without a terminal:
+#
+#   skip-dry-run  --dry-run writes nothing, so there is nothing to confirm
+#   yes-flag      --yes: the operator said so in advance, for automation
+#   no-tty        stdin is not a terminal (CI, a pipe): proceed, and SAY that
+#                 nothing confirmed the plan. A prompt here would HANG a
+#                 pipeline, and reading `yes` off a pipe would be a confirmation
+#                 from whatever wrote the pipe, which is not a human.
+#   prompt        a human at a terminal: require the word `yes`
+confirmation_decision() {  # <is-tty:0|1> <yes-flag:0|1> <dry-run:0|1>
+  local arg
+  for arg in "${1:-}" "${2:-}" "${3:-}"; do
+    case "$arg" in
+      0|1) ;;
+      *) echo "confirmation_decision: want three arguments, each 0 or 1" >&2; return 2 ;;
+    esac
+  done
+  if [ "$3" -eq 1 ]; then echo skip-dry-run
+  elif [ "$2" -eq 1 ]; then echo yes-flag
+  elif [ "$1" -eq 1 ]; then echo prompt
+  else echo no-tty
+  fi
+}
+
+# ── suggesting watch roots (the refusal path only) ────────────────────────────
+#
+# The refusal for want of --watch is CORRECT and stays: there is no default
+# watchlist, because a default names directories that do not exist here. But
+# "no" on its own leaves a stranger to guess the flag format and their own
+# paths, so the refusal also offers a list derived from THIS machine, which the
+# operator edits down and pastes. It suggests; it never applies.
+#
+# It runs on the refusal path and under --dry-run, and nowhere else: a real
+# install already knows what it is protecting, and a suggestion printed beside a
+# plan that is about to be executed reads like something that was included.
+
+#: How many candidates are offered. A list longer than this is a list nobody
+#: reads, and every extra line is a directory the operator has to notice is
+#: wrong. Ordered most-recently-modified first, so the cut falls on stale trees.
+MAX_SUGGESTED_ROOTS=8
+
+# The built-in excluded directory names, read from the PYTHON that owns the
+# list rather than copied into a second one here. A copy would drift, and the
+# direction it drifts in is suggesting a watch root inside `node_modules`.
+builtin_excluded_dir_names() {
+  /usr/bin/python3 -E -s -S -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import dhu_backup_core
+sys.stdout.write(" ".join(sorted(dhu_backup_core.EXCLUDED_DIR_NAMES)) + "\n")
+' "$SRC"
+}
+
+# The home directory of the human who typed sudo — never root's own.
+#
+# $SUDO_UID first (the same source OWNER_UID uses), then $SUDO_USER, then $HOME
+# for an unprivileged --dry-run. Under sudo, $HOME is ROOT's home, so falling
+# back to it there would offer root's directories: the daemon admits a file only
+# when `st_uid == owner_uid`, so a root-owned tree is one that would be watched
+# and would protect nothing. A home that turns out to be root-owned is therefore
+# dropped, and the caller says so rather than printing an empty list.
+invoking_user_home() {
+  /usr/bin/python3 -E -s -S -c '
+import os, pwd, sys
+uid, user = sys.argv[1], sys.argv[2]
+home = ""
+if uid.isdigit():
+    try:
+        home = pwd.getpwuid(int(uid)).pw_dir
+    except KeyError:
+        pass
+if not home and user:
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        pass
+if not home and not uid and not user:
+    home = os.environ.get("HOME", "")
+try:
+    if home and os.stat(home).st_uid == 0:
+        home = ""
+except OSError:
+    home = ""
+sys.stdout.write(home + "\n")
+' "${SUDO_UID:-}" "${SUDO_USER:-}"
+}
+
+# PURE: a watchlist id derived from a directory basename.
+#
+# The installer requires ^[a-z][a-z0-9-]*$ (max 32), which is stricter than the
+# daemon's parser on purpose, so a suggestion has to survive the same validator
+# a typed --watch does. Anything else collapses to a dash; a name that sanitises
+# to nothing becomes `repo`, because an empty id is refused by the validator and
+# a refused suggestion is worse than no suggestion.
+watch_id_from_basename() {  # <basename>
+  local id
+  id=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')
+  # Collapse runs of dashes, then trim them off both ends.
+  while [ "${id}" != "${id//--/-}" ]; do id="${id//--/-}"; done
+  id="${id#-}"; id="${id%-}"
+  # The first character must be a letter.
+  while [ -n "$id" ] && ! [[ ${id:0:1} =~ [a-z] ]]; do id="${id:1}"; done
+  id="${id%-}"
+  id="${id:0:32}"
+  id="${id%-}"
+  [ -n "$id" ] || id=repo
+  printf '%s\n' "$id"
+}
+
+# PURE: absolute paths in, ready-to-paste --watch flags out.
+#
+# Ids are de-duplicated with a numeric suffix rather than dropped: two checkouts
+# both called `api` are two directories the operator asked about, and
+# render_watchlist refuses a duplicate id outright.
+#
+# Every path is SINGLE-QUOTED, the same rule uninstall.sh follows: a watch root
+# may contain spaces, and the one glob the watchlist permits is a trailing `*`,
+# which an unquoted paste would expand against the pasting shell's cwd.
+format_watch_suggestion() {  # <absolute-path>...
+  local path base id candidate seen=" " flags="" count=0
+  if [ "$#" -eq 0 ]; then
+    echo "   No git working trees were found to suggest, so there is nothing to paste."
+    echo "   Name the directories yourself: --watch id=/abs/path (repeatable)."
+    return 0
+  fi
+  for path in "$@"; do
+    [ -n "$path" ] || continue
+    # The id comes from the last NON-glob component. `find_candidate_repos`
+    # only ever yields concrete directories, but a hand-written
+    # `/home/you/worktrees/*` has the basename `*`, which sanitises to nothing
+    # and would make every glob root the same id `repo`.
+    base="${path%/}"
+    base="${base##*/}"
+    base="${base%\*}"
+    if [ -z "$base" ]; then
+      base="${path%/*}"
+      base="${base##*/}"
+    fi
+    id=$(watch_id_from_basename "$base")
+    candidate="$id"
+    # A suffixed id must still pass the 32-character validator, so the stem is
+    # cut to leave room for it. A suggestion the installer would refuse is
+    # worse than no suggestion: the operator pastes it and is told no.
+    local stem="${id:0:29}" n=2
+    stem="${stem%-}"
+    while case "$seen" in *" $candidate "*) true ;; *) false ;; esac; do
+      candidate="${stem}-${n}"
+      n=$((n + 1))
+    done
+    seen="$seen$candidate "
+    flags="$flags --watch '$candidate=$path'"
+    count=$((count + 1))
+  done
+  echo "   $count candidate(s) on this machine, most recently modified first."
+  echo "   Read the list, delete what should not be protected, then run it:"
+  echo
+  echo "     sudo bash install.sh$flags"
+  echo
+  echo "   Size them up first — \`du -sh\` each one. A large directory inside a watch"
+  echo "   root costs real time on the first scan; see the exclusion list in README.md."
+}
+
+# The filesystem walk, ISOLATED from the formatting above so the formatting and
+# the id derivation are provable over fabricated inputs with no repository
+# anywhere. Prints absolute paths, newest first, at most <max>.
+#
+# `find -P` (the default) NEVER follows a symlink, so a link inside the home
+# directory cannot lead this into /etc or another account's tree. `-maxdepth 3`
+# on a `.git` entry means a working tree at most two levels under the home
+# directory, which is where people keep them and is a bound on the walk.
+find_candidate_repos() {  # <home> [max]
+  local home="$1" max="${2:-$MAX_SUGGESTED_ROOTS}" excluded repo base rel component skip
+  [ -d "$home" ] || return 0
+  excluded=" $(builtin_excluded_dir_names) "
+  find -P "$home" -maxdepth 3 -name .git -print 2>/dev/null |
+    while IFS= read -r dotgit; do
+      repo="${dotgit%/.git}"
+      [ "$repo" != "$dotgit" ] || continue
+      [ -d "$repo" ] || continue
+      # Every component BETWEEN the home directory and the working tree is
+      # checked, not just the tree's own name: a repository inside
+      # `node_modules` is one the daemon would refuse to descend into anyway.
+      rel="${repo#$home/}"
+      skip=0
+      while [ "$rel" != "${rel%/*}" ]; do
+        component="${rel%%/*}"
+        case "$excluded" in *" $component "*) skip=1 ;; esac
+        rel="${rel#*/}"
+      done
+      base="${repo##*/}"
+      case "$excluded" in *" $base "*) skip=1 ;; esac
+      [ "$skip" -eq 0 ] || continue
+      printf '%s\n' "$repo"
+    done | sort_paths_by_mtime_desc "$max"
+}
+
+# Newest first, at most <max>. ONE python process rather than two spellings of
+# `stat`: BSD's `stat -f` means "format" and GNU's means "file system", so the
+# portable-looking `stat -f '%m'` prints a MOUNT POINT on Linux and the ordering
+# quietly becomes arbitrary without failing.
+#
+# The cap is applied HERE rather than by a `| head -n`, which under `pipefail`
+# makes the whole pipeline non-zero the moment head closes the pipe on a long
+# list — a failure with nothing wrong, on exactly the machine with the most
+# repositories.
+sort_paths_by_mtime_desc() {  # <max>; paths on stdin
+  /usr/bin/python3 -E -s -S -c '
+import os, sys
+def mtime(path):
+    try:
+        return os.lstat(path).st_mtime
+    except OSError:
+        return 0.0
+limit = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 0
+paths = [line.rstrip("\n") for line in sys.stdin if line.strip()]
+ordered = sorted(paths, key=mtime, reverse=True)
+for path in (ordered[:limit] if limit > 0 else ordered):
+    sys.stdout.write(path + "\n")
+' "${1:-0}"
+}
+
+# The glue: home directory, walk, formatting. The only part that is not testable
+# without a filesystem, and it holds no decision of its own.
+print_watch_suggestion() {
+  local home candidates=()
+  home=$(invoking_user_home)
+  if [ -z "$home" ]; then
+    echo "   No suggestion: there is no \$SUDO_UID or \$SUDO_USER to take a home"
+    echo "   directory from, and root's own home is never suggested (the daemon"
+    echo "   admits a file only when it is owned by the configured owner_uid)."
+    return 0
+  fi
+  echo "   Looking for git working trees under $home (two levels, symlinks not followed):"
+  while IFS= read -r line; do
+    [ -n "$line" ] && candidates+=("$line")
+  done < <(find_candidate_repos "$home" "$MAX_SUGGESTED_ROOTS")
+  format_watch_suggestion ${candidates[@]+"${candidates[@]}"}
+}
+
 # How many roots a watchlist file actually names. A file of nothing but comments
 # protects nothing, and must not reach the daemon as if it did.
 watchlist_entry_count() {  # <file>
@@ -528,6 +784,7 @@ fi
 
 # ── arguments, parsed strictly ────────────────────────────────────────────────
 DRY_RUN=0
+ASSUME_YES=0
 FLAGS_GIVEN=0
 NO_SERVICE=0
 PLATFORM_FLAG=""
@@ -563,6 +820,8 @@ while [ "$#" -gt 0 ]; do
       OWNER_UID="$2"; shift 2 ;;
     --owner-uid=*)
       OWNER_UID="${1#--owner-uid=}"; shift ;;
+    --yes)
+      ASSUME_YES=1; shift ;;
     --dry-run)
       DRY_RUN=1; shift ;;
     -h|--help)
@@ -660,6 +919,12 @@ if [ "$DECISION" = refuse ]; then
   echo "   directories that do not exist on this machine, the daemon would come up" >&2
   echo "   healthy protecting nothing, and this script would print OK over an empty" >&2
   echo "   store. See src/watchlist.conf.example. Nothing has been changed." >&2
+  echo >&2
+  # The refusal stands; this only makes it useful. Printed to stderr with the
+  # refusal it belongs to, and derived from THIS machine rather than from a
+  # default list — the thing that is forbidden is a default watchlist the
+  # installer would APPLY, not a list of candidates a human edits and pastes.
+  print_watch_suggestion >&2
   exit 2
 fi
 if [ "$DECISION" = preserve ] && [ "$(watchlist_entry_count "$DEST/etc/watchlist.conf")" -eq 0 ]; then
@@ -744,8 +1009,12 @@ print_plan() {
 if [ "$DRY_RUN" -eq 1 ]; then
   print_plan
   echo
+  echo "other directories on this machine you could protect:"
+  print_watch_suggestion
+  echo
   echo "DRY RUN — nothing was written. (It read the existing watchlist, if any, to show it.)"
-  echo "Re-run without --dry-run, as root, to apply it."
+  echo "Re-run without --dry-run, as root, to apply it. A real run prints this plan"
+  echo "again and asks for the word 'yes' before it writes anything."
   exit 0
 fi
 
@@ -753,6 +1022,42 @@ fi
 [ "$(id -u)" -eq 0 ] || { echo "must run as root: sudo bash $0 [--watch id=/abs/path ...]"; exit 1; }
 
 print_plan
+
+# ── the confirmation, BEFORE anything is written ──────────────────────────────
+# Everything above this point has only read. `confirmation_decision` holds the
+# rule; this block only carries it out, so all four outcomes are asserted
+# without a terminal.
+IS_TTY=0
+[ -t 0 ] && IS_TTY=1
+case "$(confirmation_decision "$IS_TTY" "$ASSUME_YES" "$DRY_RUN")" in
+  prompt)
+    echo
+    echo "That plan installs a ROOT daemon on this machine and writes every file"
+    echo "listed above. Nothing has been changed yet."
+    printf 'Type "yes" to proceed (anything else aborts): '
+    CONFIRM_REPLY=""
+    IFS= read -r CONFIRM_REPLY || CONFIRM_REPLY=""
+    if [ "$CONFIRM_REPLY" != "yes" ]; then
+      echo
+      echo "!! aborted at the confirmation step. Nothing has been changed."
+      echo "   Re-run when you have read the plan, or pass --yes to skip this."
+      exit 1
+    fi
+    ;;
+  yes-flag)
+    echo
+    echo "-- --yes: proceeding without the confirmation prompt."
+    ;;
+  no-tty)
+    # Said out loud rather than passed over. A pipeline gets the install it
+    # asked for, and the transcript records that no human confirmed the plan —
+    # which is exactly the fact someone reading that transcript later needs.
+    echo
+    echo "-- stdin is not a terminal, so the plan above was NOT confirmed by a human."
+    echo "   Proceeding (pass --yes to say so deliberately)."
+    ;;
+esac
+
 echo
 echo "== installing DHU Backup (owner uid $OWNER_UID) =="
 

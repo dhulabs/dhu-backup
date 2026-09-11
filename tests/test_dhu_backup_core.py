@@ -1888,3 +1888,177 @@ class ExcludeGlobMatchTests(unittest.TestCase):
             # Naming it in exclude.conf changes nothing: still excluded.
             self.assertIsNotNone(
                 dhu_backup_core.exclude_glob_match(name, (name,)), name)
+
+
+class StatusExitCodeTests(unittest.TestCase):
+    """`dhu-backup status` answers with its exit code as well as its text.
+
+    Three codes for the same reason `announce_exit_code` has three: a caller
+    must be able to tell "capture has stopped" from "I could not find out
+    whether capture has stopped" without parsing prose, because those are
+    opposite claims and only one of them is a reason to page someone.
+    """
+
+    def test_the_three_sets_partition_every_health_verdict(self):
+        """No verdict is in two sets, and none is in none of them.
+
+        This is the test that makes adding a health verdict safe. A new one
+        that nobody placed makes `status_exit_code` raise, and it fails HERE —
+        in a test naming the verdict — rather than in front of an operator.
+        """
+        buckets = (dhu_backup_core.CAPTURING_VERDICTS,
+                   dhu_backup_core.NOT_CAPTURING_VERDICTS,
+                   dhu_backup_core.UNDETERMINED_VERDICTS)
+        placed = [v for bucket in buckets for v in bucket]
+        self.assertEqual(sorted(placed), sorted(dhu_backup_core.HEALTH_VERDICTS))
+        self.assertEqual(len(placed), len(set(placed)), "a verdict is in two sets")
+
+    def test_capturing_is_zero(self):
+        for verdict in ("ok", "warning"):
+            self.assertEqual(dhu_backup_core.status_exit_code(verdict), 0, verdict)
+
+    def test_warning_exits_zero_because_capture_is_still_running(self):
+        """`warning` means "capturing, and close to a budget that will stop it".
+
+        Exiting non-zero on it would fail a monitor over something that has not
+        happened, and the operator would learn to ignore the code before the
+        day it meant `degraded`.
+        """
+        self.assertEqual(dhu_backup_core.status_exit_code("warning"), 0)
+        self.assertIn("warning", dhu_backup_core.CAPTURING_VERDICTS)
+
+    def test_not_capturing_is_one(self):
+        for verdict in ("degraded", "unprotected", "scan-failed", "stale"):
+            self.assertEqual(dhu_backup_core.status_exit_code(verdict), 1, verdict)
+
+    def test_could_not_determine_is_two(self):
+        for verdict in ("no-heartbeat", "unreadable-heartbeat"):
+            self.assertEqual(dhu_backup_core.status_exit_code(verdict), 2, verdict)
+
+    def test_an_unknown_verdict_raises_rather_than_defaulting_to_healthy(self):
+        with self.assertRaises(ValueError):
+            dhu_backup_core.status_exit_code("brand-new-state")
+
+
+class StatusNextStepTests(unittest.TestCase):
+    """"Something is wrong" without "here is what to type" is half an answer."""
+
+    def step(self, verdict, platform="darwin"):
+        return dhu_backup_core.status_next_step(verdict, "/Library/DHU/backup", platform)
+
+    def test_every_health_verdict_has_an_entry(self):
+        for verdict in dhu_backup_core.HEALTH_VERDICTS:
+            step = self.step(verdict)
+            if verdict == "ok":
+                continue
+            self.assertTrue(step.sentence, verdict)
+            self.assertTrue(step.command, verdict)
+
+    def test_ok_offers_nothing_to_do(self):
+        self.assertEqual(self.step("ok"), dhu_backup_core.NextStep(None, None))
+
+    def test_an_unknown_verdict_raises(self):
+        with self.assertRaises(ValueError):
+            self.step("brand-new-state")
+
+    def test_the_two_budget_states_point_at_the_config_and_a_restart(self):
+        for verdict in ("warning", "degraded"):
+            step = self.step(verdict)
+            self.assertIn("/Library/DHU/backup/etc/dhu-backupd.conf", step.sentence, verdict)
+            self.assertIn("max_store_bytes", step.sentence, verdict)
+            self.assertEqual(step.command,
+                             dhu_backup_core.service_restart_command("darwin"), verdict)
+
+    def test_degraded_says_it_will_not_restart_itself(self):
+        """A store-wide budget never self-heals, and the remedy is a human.
+
+        An operator who reads "capture stopped" and waits is waiting for
+        something that has been designed not to happen.
+        """
+        self.assertIn("will not restart itself", self.step("degraded").sentence)
+
+    def test_unprotected_points_at_the_watchlist_and_the_log(self):
+        step = self.step("unprotected")
+        self.assertIn("--watch", step.command)
+        self.assertIn("dhu-backupd.log", step.sentence)
+
+    def test_the_commands_name_the_right_service_manager_per_platform(self):
+        self.assertIn("launchctl", self.step("stale", "darwin").command)
+        self.assertIn("systemctl", self.step("stale", "linux").command)
+
+    def test_the_install_root_it_is_given_is_the_one_it_names(self):
+        """A next step for another install must not name the default one."""
+        step = dhu_backup_core.status_next_step(
+            "unreadable-heartbeat", "/tmp/other-root", "darwin")
+        self.assertIn("/tmp/other-root/var/state.json", step.command)
+        self.assertNotIn("/Library", step.command)
+
+
+class ServiceCommandTests(unittest.TestCase):
+    def test_both_platforms_are_named(self):
+        for table in (dhu_backup_core.SERVICE_RESTART_COMMANDS,
+                      dhu_backup_core.SERVICE_STATUS_COMMANDS):
+            self.assertEqual(sorted(table), ["darwin", "linux"])
+
+    def test_an_unknown_platform_gets_the_macos_spelling_not_a_crash(self):
+        """Same rule as `install_root_for_platform`: this is TEXT in a hint.
+
+        A wrong string in printed advice is useless; a crash in the command an
+        operator runs when their work has vanished is worse.
+        """
+        self.assertEqual(dhu_backup_core.service_restart_command("win32"),
+                         dhu_backup_core.SERVICE_RESTART_COMMANDS["darwin"])
+
+    def test_linux_variants_all_resolve_to_linux(self):
+        for platform in ("linux", "linux2", "linux-armv7l"):
+            self.assertEqual(dhu_backup_core.service_status_command(platform),
+                             dhu_backup_core.SERVICE_STATUS_COMMANDS["linux"], platform)
+
+
+class BudgetHeadroomTests(unittest.TestCase):
+    """How much is LEFT — the question a human asks on reading a warning."""
+
+    def test_headroom_is_what_remains_before_each_budget_binds(self):
+        limits = dhu_backup_core.DEFAULT_LIMITS._replace(
+            max_store_bytes=1000, min_free_bytes=500)
+        headroom = dhu_backup_core.budget_headroom(600, 800, limits)
+        self.assertEqual(headroom.store_left, 400)
+        self.assertEqual(headroom.free_left, 300)
+
+    def test_an_unmeasured_free_space_is_None_and_never_zero(self):
+        """A failed `statvfs` became `free_bytes = 0` once, and 0 here reads as
+        "no headroom at all" — a fabricated report of the worst case."""
+        headroom = dhu_backup_core.budget_headroom(0, None)
+        self.assertIsNone(headroom.free_left)
+
+    def test_it_goes_negative_rather_than_clamping(self):
+        """Over the ceiling and exactly at it are different facts, and only the
+        first tells the operator how much to free."""
+        limits = dhu_backup_core.DEFAULT_LIMITS._replace(
+            max_store_bytes=1000, min_free_bytes=500)
+        headroom = dhu_backup_core.budget_headroom(1500, 100, limits)
+        self.assertEqual(headroom.store_left, -500)
+        self.assertEqual(headroom.free_left, -400)
+
+    def test_zero_headroom_is_exactly_where_the_decision_function_degrades(self):
+        """The headroom and the gate must agree about where the edge is.
+
+        Asserted against `budget_decision` itself rather than against a
+        re-derived threshold, the way `budget_warning` defers to it.
+        """
+        limits = dhu_backup_core.DEFAULT_LIMITS._replace(
+            max_store_bytes=1000, min_free_bytes=500)
+        headroom = dhu_backup_core.budget_headroom(1000, 500, limits)
+        self.assertEqual(headroom.store_left, 0)
+        self.assertEqual(headroom.free_left, 0)
+        # One more byte in either direction is a stop.
+        self.assertIsInstance(budget_decision(1000, 500, 1, limits), Degraded)
+
+
+class HumanBytesTests(unittest.TestCase):
+    """One byte formatter, because two would disagree in the same output."""
+
+    def test_it_scales_rather_than_fixing_at_gib(self):
+        self.assertEqual(dhu_backup_core.human_bytes(1100), "1.1 KiB")
+        self.assertEqual(dhu_backup_core.human_bytes(5 * 1024 ** 3), "5.0 GiB")
+        self.assertEqual(dhu_backup_core.human_bytes(12), "12 bytes")

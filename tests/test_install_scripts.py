@@ -108,7 +108,7 @@ def call_function(script, func, *args):
     return run_bash(["-c", prog, "_", script, func] + list(args))
 
 
-def call_snippet(script, snippet, *args):
+def call_snippet(script, snippet, *args, **kwargs):
     """Source `script` for its functions only, then run `snippet` with $1.. set.
 
     The same trick as `call_function` with a body instead of a single name, for
@@ -116,9 +116,12 @@ def call_snippet(script, snippet, *args):
     (`uninstall_state`, then `print_plan_for`), exactly as the script itself
     does it. The sourced script's own `set -euo pipefail` is in force here, so
     the snippet runs under the same shell options the real flow does.
+
+    `env=` reaches `run_bash`, for the snippets whose behaviour depends on what
+    sudo did or did not export — `$SUDO_UID` and `$SUDO_USER`.
     """
     prog = 'DHU_BACKUP_SOURCE_ONLY=1 . "$1" || exit 99\nshift\n' + snippet + "\n"
-    return run_bash(["-c", prog, "_", script] + list(args))
+    return run_bash(["-c", prog, "_", script] + list(args), env=kwargs.get("env"))
 
 
 def fabricate_install_root(case, subdirs=("bin", "etc", "store", "vault", "var")):
@@ -1467,3 +1470,391 @@ def INSTALL_FILES_TABLE(source):
     """The `INSTALL_FILES` table — the only list of things a run writes."""
     start = source.index("INSTALL_FILES=\"")
     return source[start:source.index("\"\n", start + 16)]
+
+
+class ConfirmationDecisionTest(unittest.TestCase):
+    """The plan is printed either way; this decides whether it is CONFRONTED.
+
+    Not a security control — anyone typing `sudo bash install.sh` has already
+    decided — but the difference between a plan that scrolls past and a plan
+    somebody read. All eight combinations are reachable here because the rule
+    is a pure function over three booleans; none of them needs a terminal.
+    """
+
+    def decide(self, is_tty, yes_flag, dry_run):
+        rc, out = call_function(INSTALL, "confirmation_decision",
+                               str(is_tty), str(yes_flag), str(dry_run))
+        self.assertEqual(rc, 0, out)
+        return out.strip()
+
+    def test_a_human_at_a_terminal_is_asked(self):
+        self.assertEqual(self.decide(1, 0, 0), "prompt")
+
+    def test_the_yes_flag_skips_the_prompt(self):
+        self.assertEqual(self.decide(1, 1, 0), "yes-flag")
+        self.assertEqual(self.decide(0, 1, 0), "yes-flag")
+
+    def test_a_non_terminal_stdin_proceeds_rather_than_hanging(self):
+        """A prompt would hang CI and a pipe, and a `yes` read off a pipe is a
+        confirmation from whatever wrote the pipe, which is not a human."""
+        self.assertEqual(self.decide(0, 0, 0), "no-tty")
+
+    def test_a_dry_run_is_never_confirmed_because_it_writes_nothing(self):
+        for is_tty in (0, 1):
+            for yes_flag in (0, 1):
+                self.assertEqual(self.decide(is_tty, yes_flag, 1), "skip-dry-run",
+                                 "tty=%s yes=%s" % (is_tty, yes_flag))
+
+    def test_every_combination_returns_one_of_the_four_outcomes(self):
+        seen = set()
+        for is_tty in (0, 1):
+            for yes_flag in (0, 1):
+                for dry_run in (0, 1):
+                    seen.add(self.decide(is_tty, yes_flag, dry_run))
+        self.assertEqual(seen, {"prompt", "yes-flag", "no-tty", "skip-dry-run"})
+
+    def test_non_boolean_arguments_are_refused(self):
+        rc, out = call_function(INSTALL, "confirmation_decision", "2", "0", "0")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("0 or 1", out)
+
+
+class ConfirmationWiringTest(unittest.TestCase):
+    """The prompt has to sit between the plan and the first write, or it is
+    asking about something that has already happened."""
+
+    def setUp(self):
+        with open(INSTALL) as handle:
+            self.source = handle.read()
+
+    def test_the_confirmation_comes_after_the_plan_and_before_any_write(self):
+        confirm = self.source.index('confirmation_decision "$IS_TTY"')
+        plan = self.source.index("\nprint_plan\n")
+        first_write = self.source.index('install -d -o root')
+        self.assertLess(plan, confirm)
+        self.assertLess(confirm, first_write)
+
+    def test_it_is_reached_only_after_the_dry_run_branch_has_exited(self):
+        """A dry run must not prompt: it writes nothing, so there is nothing to
+        agree to, and asking would teach people to type `yes` by reflex."""
+        dry_exit = self.source.index('DRY RUN — nothing was written')
+        self.assertLess(dry_exit, self.source.index('confirmation_decision "$IS_TTY"'))
+
+    def test_the_abort_says_nothing_was_changed(self):
+        self.assertIn("aborted at the confirmation step. Nothing has been changed",
+                      self.source)
+
+    def test_the_non_tty_path_says_that_no_human_confirmed(self):
+        """Proceeding silently would leave a transcript that cannot be told
+        apart from one a human read."""
+        self.assertIn("NOT confirmed by a human", self.source)
+
+    def test_the_word_is_yes_and_not_a_keypress(self):
+        self.assertIn('Type "yes" to proceed', self.source)
+        self.assertIn('[ "$CONFIRM_REPLY" != "yes" ]', self.source)
+
+    def test_the_yes_flag_is_parsed_and_documented(self):
+        self.assertIn("--yes)\n      ASSUME_YES=1; shift ;;", self.source)
+        rc, out = run_bash([INSTALL, "--help"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--yes", out)
+
+    def test_an_unknown_flag_is_still_refused(self):
+        rc, out = run_bash([INSTALL, "--yess"])
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("unknown argument", out)
+
+
+class WatchIdFromBasenameTest(unittest.TestCase):
+    """A suggested id must survive the installer's OWN validator.
+
+    A suggestion the installer would then refuse is worse than no suggestion:
+    the operator pastes it and is told no, by the tool that offered it.
+    """
+
+    def derive(self, basename):
+        rc, out = call_function(INSTALL, "watch_id_from_basename", basename)
+        self.assertEqual(rc, 0, out)
+        return out.strip()
+
+    def test_it_lowercases_and_replaces_what_the_id_rule_forbids(self):
+        self.assertEqual(self.derive("MyRepo"), "myrepo")
+        self.assertEqual(self.derive("a.b.c"), "a-b-c")
+        self.assertEqual(self.derive("my side project"), "my-side-project")
+
+    def test_it_never_starts_with_a_non_letter(self):
+        self.assertEqual(self.derive("2fast"), "fast")
+        self.assertEqual(self.derive(".dotfiles"), "dotfiles")
+
+    def test_a_name_that_sanitises_to_nothing_becomes_repo(self):
+        for basename in ("___", "----", "42", ""):
+            self.assertEqual(self.derive(basename), "repo", basename)
+
+    def test_it_is_capped_at_the_validator_length(self):
+        derived = self.derive("A" * 60)
+        self.assertLessEqual(len(derived), 32)
+
+    def test_every_derived_id_passes_validate_watch_entry(self):
+        """The two are asserted against each other rather than read side by side."""
+        for basename in ("MyRepo", "2fast", "___", "a.b.c", "----", ".dotfiles",
+                         "A" * 60, "my repo", "repo!!", "-x-"):
+            derived = self.derive(basename)
+            rc, out = call_snippet(INSTALL,
+                                   'validate_watch_entry "$1" "/tmp/x" "suggested"',
+                                   derived)
+            self.assertEqual(rc, 0, "%r -> %r was refused: %s" % (basename, derived, out))
+
+
+class WatchSuggestionFormatTest(unittest.TestCase):
+    """Paths in, ready-to-paste flags out. No filesystem involved."""
+
+    def suggest(self, *paths):
+        rc, out = call_function(INSTALL, "format_watch_suggestion", *paths)
+        self.assertEqual(rc, 0, out)
+        return out
+
+    def test_each_path_becomes_a_single_quoted_watch_flag(self):
+        out = self.suggest("/home/a/proj", "/home/a/other")
+        self.assertIn("--watch 'proj=/home/a/proj'", out)
+        self.assertIn("--watch 'other=/home/a/other'", out)
+        self.assertIn("sudo bash install.sh", out)
+
+    def test_a_path_with_a_space_is_quoted_so_pasting_cannot_split_it(self):
+        out = self.suggest("/home/a/my side project")
+        self.assertIn("--watch 'my-side-project=/home/a/my side project'", out)
+
+    def test_a_glob_path_is_quoted_so_pasting_cannot_expand_it(self):
+        """The same rule uninstall.sh follows, for the same reason: unquoted,
+        the pasting shell would expand it against its own cwd."""
+        out = self.suggest("/home/a/.claude/worktrees/*")
+        self.assertIn("--watch 'worktrees=/home/a/.claude/worktrees/*'", out)
+        self.assertNotIn("--watch worktrees=", out)
+
+    def test_a_trailing_glob_takes_its_id_from_the_last_real_component(self):
+        """`/home/a/worktrees/*` has the basename `*`, which sanitises to
+        nothing — every glob root would otherwise be called `repo`."""
+        out = self.suggest("/home/a/.claude/worktrees/*", "/home/a/hapos-task-*")
+        self.assertIn("--watch 'worktrees=/home/a/.claude/worktrees/*'", out)
+        self.assertIn("--watch 'hapos-task=/home/a/hapos-task-*'", out)
+
+    def test_duplicate_ids_are_suffixed_rather_than_dropped(self):
+        """render_watchlist refuses a duplicate id outright, and both
+        directories are ones the operator asked about."""
+        out = self.suggest("/a/api", "/b/api", "/c/API")
+        self.assertIn("'api=/a/api'", out)
+        self.assertIn("'api-2=/b/api'", out)
+        self.assertIn("'api-3=/c/API'", out)
+
+    def test_a_suffixed_id_still_fits_the_validator(self):
+        out = self.suggest("/a/" + "N" * 40, "/b/" + "N" * 40)
+        ids = re.findall(r"--watch '([a-z0-9-]+)=", out)
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
+        for identifier in ids:
+            self.assertLessEqual(len(identifier), 32, identifier)
+
+    def test_nothing_found_says_so_rather_than_printing_an_empty_command(self):
+        """An empty `sudo bash install.sh` line is a command that refuses."""
+        out = self.suggest()
+        self.assertIn("No git working trees were found", out)
+        self.assertNotIn("sudo bash install.sh --watch", out)
+        self.assertIn("--watch id=/abs/path", out)
+
+
+class WatchSuggestionSearchTest(unittest.TestCase):
+    """The walk, against a FABRICATED home directory.
+
+    Nothing here reads the machine's real home: the search is a function of a
+    directory tree, so a fabricated one is a complete population for it.
+    """
+
+    def fabricate_home(self):
+        base = tempfile.mkdtemp(prefix="dhu-suggest-home-")
+        self.addCleanup(shutil.rmtree, base, True)
+        return base
+
+    def make_repo(self, home, relative, mtime=None):
+        repo = os.path.join(home, relative)
+        os.makedirs(os.path.join(repo, ".git"))
+        if mtime is not None:
+            os.utime(repo, (mtime, mtime))
+        return repo
+
+    def search(self, home, maximum=8):
+        rc, out = call_function(INSTALL, "find_candidate_repos", home, str(maximum))
+        self.assertEqual(rc, 0, out)
+        return [line for line in out.splitlines() if line.strip()]
+
+    def test_it_finds_working_trees_one_and_two_levels_down(self):
+        home = self.fabricate_home()
+        shallow = self.make_repo(home, "proj")
+        deep = self.make_repo(home, "Projects/thing")
+        self.assertEqual(sorted(self.search(home)), sorted([shallow, deep]))
+
+    def test_it_does_not_go_deeper_than_two_levels(self):
+        home = self.fabricate_home()
+        self.make_repo(home, "a/b/c/too-deep")
+        self.assertEqual(self.search(home), [])
+
+    def test_built_in_excluded_directories_are_skipped_at_every_level(self):
+        """A repository inside `node_modules` is one the daemon's walk would
+        refuse to descend into anyway."""
+        home = self.fabricate_home()
+        self.make_repo(home, "node_modules/pkg")
+        self.make_repo(home, "proj/.venv")
+        keep = self.make_repo(home, "proj")
+        self.assertEqual(self.search(home), [keep])
+
+    def test_it_is_ordered_most_recently_modified_first(self):
+        home = self.fabricate_home()
+        old = self.make_repo(home, "old", mtime=1_600_000_000)
+        new = self.make_repo(home, "new", mtime=1_700_000_000)
+        middle = self.make_repo(home, "middle", mtime=1_650_000_000)
+        self.assertEqual(self.search(home), [new, middle, old])
+
+    def test_the_list_is_capped_and_the_cap_keeps_the_newest(self):
+        home = self.fabricate_home()
+        for index in range(6):
+            self.make_repo(home, "repo%d" % index, mtime=1_600_000_000 + index)
+        found = self.search(home, maximum=2)
+        self.assertEqual(len(found), 2)
+        self.assertEqual([os.path.basename(p) for p in found], ["repo5", "repo4"])
+
+    def test_a_symlink_out_of_the_home_directory_is_not_followed(self):
+        """`find -P`, asserted rather than assumed: a link inside the home
+        directory must not lead the search into another account's tree."""
+        home = self.fabricate_home()
+        outside = self.fabricate_home()
+        self.make_repo(outside, "secret")
+        os.symlink(outside, os.path.join(home, "link"))
+        self.assertEqual(self.search(home), [])
+
+    def test_a_home_that_does_not_exist_finds_nothing_and_does_not_fail(self):
+        self.assertEqual(self.search("/nonexistent-home-xyz"), [])
+
+    def test_the_excluded_names_come_from_the_python_that_owns_the_list(self):
+        """A second copy in bash would drift, and the direction it drifts in is
+        suggesting a watch root inside `node_modules`."""
+        rc, out = call_function(INSTALL, "builtin_excluded_dir_names")
+        self.assertEqual(rc, 0, out)
+        sys.path.insert(0, SRC)
+        import dhu_backup_core
+        self.assertEqual(sorted(out.split()),
+                         sorted(dhu_backup_core.EXCLUDED_DIR_NAMES))
+
+
+class WatchSuggestionWiringTest(unittest.TestCase):
+    """WHERE the suggestion may appear, which is the part that matters.
+
+    It refuses to be a default watchlist: it runs on the refusal path and under
+    --dry-run, and a real install — which already knows what it is protecting —
+    never calls it. A suggestion printed beside a plan about to be executed
+    reads like something that was included in it.
+    """
+
+    def setUp(self):
+        with open(INSTALL) as handle:
+            self.source = handle.read()
+
+    def test_the_refusal_for_want_of_watch_roots_offers_a_suggestion(self):
+        branch = self.source[self.source.index("!! no watch roots:"):]
+        branch = branch[:branch.index("exit 2")]
+        self.assertIn("print_watch_suggestion", branch)
+        # And the refusal itself is unchanged: still no default watchlist.
+        self.assertIn("There is no default watchlist on purpose", branch)
+        self.assertIn("Nothing has been changed", branch)
+
+    def test_it_is_called_only_from_the_refusal_path_and_the_dry_run(self):
+        calls = [line.strip() for line in self.source.splitlines()
+                 if "print_watch_suggestion" in line and not line.strip().startswith("#")
+                 and "print_watch_suggestion()" not in line]
+        self.assertEqual(len(calls), 2, calls)
+        after_dry_exit = self.source[self.source.index("# ── the PLAN is executed"):]
+        self.assertNotIn("print_watch_suggestion", after_dry_exit)
+
+    def test_a_home_that_cannot_be_resolved_says_so_rather_than_guessing(self):
+        """Under sudo, $HOME is ROOT's home. Falling back to it would suggest
+        root-owned directories, which the daemon admits no file from — it would
+        be a watch root that protects nothing."""
+        rc, out = call_snippet(INSTALL, 'print_watch_suggestion',
+                               env={"SUDO_UID": "4294967000", "SUDO_USER": None})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("No suggestion", out)
+        self.assertIn("root's own home is never suggested", out)
+
+    def test_the_dry_run_prints_candidates_and_says_a_real_run_will_ask(self):
+        rc, out = run_bash([INSTALL, "--dry-run", "--watch", "repo=/tmp/x"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("other directories on this machine you could protect", out)
+        self.assertIn("asks for the word 'yes'", out)
+
+
+class SortPathsByMtimeTest(unittest.TestCase):
+    """The ordering helper, and the pipefail trap it exists to avoid.
+
+    A `| head -n` would make the whole pipeline non-zero the moment head closed
+    the pipe — a failure with nothing wrong, on exactly the machine with the
+    most repositories — so the cap is applied inside the sorter.
+    """
+
+    def sort(self, paths, maximum):
+        prog = ('DHU_BACKUP_SOURCE_ONLY=1 . "$1" || exit 99\n'
+                'printf "%s\\n" "${@:3}" | sort_paths_by_mtime_desc "$2"\n')
+        rc, out = run_bash(["-c", prog, "_", INSTALL, str(maximum)] + list(paths))
+        self.assertEqual(rc, 0, out)
+        return [line for line in out.splitlines() if line.strip()]
+
+    def test_a_long_list_capped_short_still_exits_zero(self):
+        base = tempfile.mkdtemp(prefix="dhu-mtime-")
+        self.addCleanup(shutil.rmtree, base, True)
+        paths = []
+        for index in range(400):
+            path = os.path.join(base, "d%03d" % index)
+            os.mkdir(path)
+            os.utime(path, (1_600_000_000 + index, 1_600_000_000 + index))
+            paths.append(path)
+        found = self.sort(paths, 3)
+        self.assertEqual([os.path.basename(p) for p in found],
+                         ["d399", "d398", "d397"])
+
+    def test_zero_means_no_cap(self):
+        self.assertEqual(len(self.sort(["/nonexistent/a", "/nonexistent/b"], 0)), 2)
+
+
+class ServiceCommandAgreementTest(unittest.TestCase):
+    """`status` prints a restart command; `install.sh` prints its own copy.
+
+    The installer cannot import a Python table, so the string exists twice —
+    the same duplication `DEFAULT_INSTALL_ROOTS` has, and asserted the same
+    way. A restart command naming the wrong service manager is advice that
+    fails in front of an operator who is already having a bad day.
+    """
+
+    def shell_restart_hint(self, platform):
+        rc, out = call_snippet(INSTALL,
+                               'set_platform "$1" >/dev/null; service_restart_hint',
+                               platform)
+        self.assertEqual(rc, 0, out)
+        return out.strip()
+
+    def test_both_platforms_agree_with_the_python_table(self):
+        sys.path.insert(0, SRC)
+        import dhu_backup_core
+        for platform in ("darwin", "linux"):
+            self.assertEqual(self.shell_restart_hint(platform),
+                             dhu_backup_core.service_restart_command(platform),
+                             platform)
+
+    def test_the_status_commands_name_the_same_service(self):
+        """`service_status_hint` prints a compound for systemd, so only the
+        service name is common to both spellings."""
+        sys.path.insert(0, SRC)
+        import dhu_backup_core
+        for platform, name in (("darwin", "com.dhulabs.backup"),
+                               ("linux", "dhu-backupd")):
+            self.assertIn(name, dhu_backup_core.service_status_command(platform))
+            rc, out = call_snippet(INSTALL,
+                                   'set_platform "$1" >/dev/null; service_status_hint',
+                                   platform)
+            self.assertEqual(rc, 0, out)
+            self.assertIn(name, out)

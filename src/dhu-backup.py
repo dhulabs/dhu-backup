@@ -9,6 +9,7 @@
 # survive (review H3).
 """DHU Backup — recovery. Installed as `bin/dhu-backup`. UNPRIVILEGED.
 
+    dhu-backup status [--json]                     is this working? and if not, what to type
     dhu-backup ls   <path-substring> [--root ID]   which protected paths have versions
     dhu-backup log  <path>                         versions of one path: time, size, hash
     dhu-backup cat  <path> [--asof T|--version @TAG]  print one version to stdout
@@ -242,6 +243,432 @@ def _emit_json(payload):
     print(json.dumps(payload, indent=2))
 
 
+# ── status: "is this working?", answered unprivileged ─────────────────────────
+#
+# Everything below reads. The one question this product could not answer without
+# `cat var/state.json` was the everyday one, and a status a human only reads by
+# parsing JSON is a status nobody reads until the day their work is gone.
+
+#: Version directories `status` will OPEN, across every watch root, to count the
+#: paths the store holds. It is a budget rather than a cap on the answer because
+#: it is the thing that costs: a path's versions are siblings in one directory,
+#: so the only way to learn a path's NAME is to look inside a version directory.
+#: Measured on a real store (2026-09-11): 37,425 version directories cost 1.2 s
+#: of opens on top of a 0.6 s tree walk, so 20,000 keeps the whole command under
+#: about a second on a store far larger than a first install has.
+#:
+#: A root whose share of the budget runs out reports "at least N", never a
+#: silently truncated number — the same rule the announce probe follows when it
+#: caps a version listing.
+STATUS_VERSION_DIR_BUDGET = 20000
+
+
+def read_watchlist(install_root):
+    """`(entries, refusals, error)` from the root-owned `etc/watchlist.conf`.
+
+    This file, not `var/roots/`, is what "the watch roots in force" means. The
+    manifests under `var/roots/` are written per EXPANDED root and are never
+    removed, so a machine whose watchlist changed last month still has
+    manifests for directories nothing watches now — reading those would report
+    protection that ended weeks ago.
+
+    It is 0644 root-owned by design, so this needs no privilege. Unreadable is
+    REPORTED as an error and never as "no roots configured": the second is a
+    claim about the machine, and this code would not have grounds for it.
+    """
+    path = os.path.join(install_root, "etc", "watchlist.conf")
+    try:
+        with open(path) as handle:
+            text = handle.read()
+    except (IOError, OSError) as exc:
+        return (), (), "watchlist-unreadable: %s (%s)" % (path, exc)
+    entries, refusals = dhu_backup_core.parse_watchlist(text)
+    return entries, refusals, None
+
+
+def count_held_paths(store_dir, root_id, budget):
+    """`(paths, capped, error, opened)` — distinct paths held under one root id.
+
+    A PATH count, not a version count: a file with 200 versions counts once.
+    The distinction matters because the number is read as "how much of my work
+    is in there", and versions-per-path is a retention setting.
+
+    The walk descends `store/<root-id>/` and treats a version-key directory as a
+    leaf, opening it for the one basename it holds. `budget` bounds how many of
+    those opens happen; when it runs out the count so far is returned with
+    `capped=True`, so the caller says "at least N". `opened` is what was
+    actually spent, so a root that finishes under its share hands the remainder
+    back rather than burning it.
+    """
+    base = os.path.join(store_dir, root_id)
+    held = set()
+    opened = [0]
+
+    def walk(directory):
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError as exc:
+            raise _StoreWalkError(_errtext(exc, directory))
+        subdirectories = []
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:                                  # pragma: no cover
+                continue
+            if dhu_backup_core.parse_version_key(entry.name) is None:
+                subdirectories.append(entry.path)
+                continue
+            if opened[0] >= budget:
+                return False
+            opened[0] += 1
+            try:
+                names = os.listdir(entry.path)
+            except OSError as exc:
+                # A version directory that cannot be listed is a path this
+                # command cannot name, and skipping it quietly would subtract
+                # one from a number a human reads as "how much of my work is in
+                # there". Reported as an error on the whole root instead.
+                raise _StoreWalkError(_errtext(exc, entry.path))
+            for leaf in names:
+                held.add((directory, leaf))
+        for subdirectory in subdirectories:
+            if not walk(subdirectory):
+                return False
+        return True
+
+    if not os.path.isdir(base):
+        # An answer, not a failure: the daemon writes `store/<root-id>/` on the
+        # first capture, so a root configured five minutes ago legitimately has
+        # no directory yet.
+        return 0, False, None, 0
+    try:
+        complete = walk(base)
+    except _StoreWalkError as exc:
+        return len(held), True, str(exc), opened[0]
+    return len(held), not complete, None, opened[0]
+
+
+class _StoreWalkError(Exception):
+    """A directory under the store could not be read. Reported, never swallowed."""
+
+
+def _errtext(exc, path):
+    strerror = getattr(exc, "strerror", None)
+    return "%s: %s" % (strerror or type(exc).__name__, path)
+
+
+def held_paths_by_root_id(install_root, root_ids, budget=STATUS_VERSION_DIR_BUDGET):
+    """`{root_id: (paths, capped, error)}`, sharing one budget across the roots.
+
+    The budget is divided as the walk goes — each root gets an equal share of
+    what is LEFT, and hands back whatever it did not spend — so a first root
+    with a huge history cannot consume the whole allowance and leave every later
+    root reporting nothing, and four small roots do not leave three quarters of
+    the budget unused. Deterministic: the same store, walked in watchlist order,
+    produces the same numbers on every run.
+    """
+    store_dir = os.path.join(install_root, dhu_backup_core.STORE_TREE)
+    counts = {}
+    remaining = max(0, int(budget))
+    left = list(root_ids)
+    while left:
+        root_id = left.pop(0)
+        share = remaining // (len(left) + 1)
+        paths, capped, error, opened = count_held_paths(store_dir, root_id, share)
+        counts[root_id] = (paths, capped, error)
+        remaining = max(0, remaining - opened)
+    return counts
+
+
+def store_root_ids(install_root):
+    """`(root_ids, error)` — the top level of `store/`, one entry per watch id."""
+    store_dir = os.path.join(install_root, dhu_backup_core.STORE_TREE)
+    try:
+        names = sorted(os.listdir(store_dir))
+    except OSError as exc:
+        return (), "store-unreadable: %s" % _errtext(exc, store_dir)
+    return tuple(n for n in names if os.path.isdir(os.path.join(store_dir, n))), None
+
+
+def status_payload(install_root, now=None, budget=STATUS_VERSION_DIR_BUDGET,
+                   platform_string=None):
+    """Everything `status` reports, as DATA. NEVER raises.
+
+    The contract `announce` holds, for the same reason: this is the command an
+    operator runs when they already suspect something is wrong, and a traceback
+    there answers the question with "and now the tool is broken too".
+    """
+    now_epoch = time.time() if now is None else now
+    platform_string = sys.platform if platform_string is None else platform_string
+    if not isinstance(install_root, str) or not install_root:
+        # Never silently substitute the default, for the reason `announce` does
+        # not: an answer about a DIFFERENT install is the worst answer this
+        # command can give, and "capturing normally" about the wrong store is
+        # worse still.
+        return _status_undetermined(
+            dhu_backup_core.DEFAULT_INSTALL_ROOT,
+            "install_root is not a path: %r" % (install_root,), platform_string)
+    try:
+        return _status_payload(install_root, now_epoch, budget, platform_string)
+    except Exception as exc:            # noqa: BLE001 — the whole point
+        return _status_undetermined(
+            install_root,
+            "the status lookup itself failed: %s: %s" % (type(exc).__name__, exc),
+            platform_string)
+
+
+def _status_undetermined(install_root, detail, platform_string):
+    """The payload for "I could not find out", with every field still present.
+
+    A caller reading `--json` gets the same keys it gets from a healthy
+    install, so a missing field never has to stand in for a failure.
+    """
+    step = dhu_backup_core.status_next_step(
+        "unreadable-heartbeat", install_root, platform_string)
+    return {
+        "install_root": install_root,
+        "health": {"verdict": "unreadable-heartbeat", "detail": detail,
+                   "sentence": dhu_backup_announce.health_sentence("unreadable-heartbeat")},
+        "capturing": False,
+        "exit_code": dhu_backup_core.status_exit_code("unreadable-heartbeat"),
+        "last_capture": None, "watch_roots": None, "store": None,
+        "free_space": None, "warning": None, "exclusions": None, "vault_extra": None,
+        "next_step": {"sentence": step.sentence, "command": step.command},
+    }
+
+
+def _status_payload(install_root, now_epoch, budget, platform_string):
+    state, health = dhu_backup_announce.read_state(install_root, now_epoch)
+    state = state if isinstance(state, dict) else {}
+    step = dhu_backup_core.status_next_step(health.verdict, install_root, platform_string)
+
+    payload = {
+        "install_root": install_root,
+        "health": {"verdict": health.verdict, "detail": health.detail,
+                   "sentence": dhu_backup_announce.health_sentence(health.verdict)},
+        "capturing": health.verdict in dhu_backup_core.CAPTURING_VERDICTS,
+        "exit_code": dhu_backup_core.status_exit_code(health.verdict),
+        "last_capture": _last_capture(state, now_epoch),
+        "watch_roots": _watch_root_status(install_root, state, budget),
+        "store": _store_status(state),
+        "free_space": _free_space_status(state),
+        "warning": _warning_status(state, health),
+        "exclusions": _glob_status(state, "exclude_globs", "exclude_refused"),
+        "vault_extra": _glob_status(state, "vault_extra_globs", "vault_extra_refused"),
+        "next_step": {"sentence": step.sentence, "command": step.command},
+    }
+    return payload
+
+
+def _last_capture(state, now_epoch):
+    raw = state.get("last_scan_epoch")
+    try:
+        epoch = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return {"epoch": epoch, "iso": _iso(epoch * 1_000_000_000),
+            "age_seconds": max(0, int(now_epoch) - epoch)}
+
+
+def _limits_from_state(state):
+    """The daemon's OWN budgets, not this module's defaults.
+
+    `etc/dhu-backupd.conf` can raise either ceiling, and that is the documented
+    way out of DEGRADED — so a status that measured headroom against the
+    compiled-in defaults would print the wrong number on precisely the machine
+    where somebody acted on the last one. Every heartbeat carries both.
+    """
+    limits = dhu_backup_core.DEFAULT_LIMITS
+    for field, key in (("max_store_bytes", "max_store_bytes"),
+                       ("min_free_bytes", "min_free_bytes")):
+        value = state.get(key)
+        if isinstance(value, int) and value > 0:
+            limits = limits._replace(**{field: value})
+    return limits
+
+
+def _store_status(state):
+    store_bytes = state.get("store_bytes")
+    if not isinstance(store_bytes, int):
+        return None
+    limits = _limits_from_state(state)
+    headroom = dhu_backup_core.budget_headroom(store_bytes, None, limits)
+    return {"bytes": store_bytes, "human": dhu_backup_core.human_bytes(store_bytes),
+            "ceiling_bytes": limits.max_store_bytes,
+            "ceiling_human": dhu_backup_core.human_bytes(limits.max_store_bytes),
+            "headroom_bytes": headroom.store_left,
+            "headroom_human": dhu_backup_core.human_bytes(max(0, headroom.store_left))}
+
+
+def _free_space_status(state):
+    free_bytes = state.get("free_bytes")
+    if not isinstance(free_bytes, int):
+        # None here means the daemon did not measure it this cycle, which it
+        # reports on its own path. Never 0: a fabricated "the volume is full"
+        # beside a heartbeat showing 30 GB free is a defect this project shipped
+        # once already.
+        return None
+    limits = _limits_from_state(state)
+    headroom = dhu_backup_core.budget_headroom(0, free_bytes, limits)
+    return {"bytes": free_bytes, "human": dhu_backup_core.human_bytes(free_bytes),
+            "floor_bytes": limits.min_free_bytes,
+            "floor_human": dhu_backup_core.human_bytes(limits.min_free_bytes),
+            "headroom_bytes": headroom.free_left,
+            "headroom_human": dhu_backup_core.human_bytes(max(0, headroom.free_left))}
+
+
+def _warning_status(state, health):
+    if health.verdict != "warning":
+        return None
+    reasons = state.get("warning_reason")
+    if not isinstance(reasons, (list, tuple)):
+        reasons = [reasons] if reasons else []
+    return {"reasons": [str(r) for r in reasons],
+            "detail": str(state.get("warning_detail") or health.detail)}
+
+
+def _glob_status(state, globs_key, refused_key):
+    """`{"globs": n, "refused": n}` or None when there are none of either.
+
+    None means "the operator has added no rules of this kind", which is the
+    common case and deserves no line at all. Zero globs WITH refusals is not
+    that: it means every line the operator wrote was thrown out, which is the
+    one case here worth printing.
+    """
+    globs = state.get(globs_key)
+    refused = state.get(refused_key)
+    globs = globs if isinstance(globs, int) else 0
+    refused = refused if isinstance(refused, int) else 0
+    if not globs and not refused:
+        return None
+    return {"globs": globs, "refused": refused}
+
+
+def _watch_root_status(install_root, state, budget):
+    """The roots in force, each with the count of paths the store holds for it."""
+    entries, refusals, error = read_watchlist(install_root)
+    ids, store_error = store_root_ids(install_root)
+    configured_ids = [root_id for root_id, _pattern in entries]
+    counts = held_paths_by_root_id(install_root, configured_ids, budget) if not error else {}
+
+    roots = []
+    for root_id, pattern in entries:
+        paths, capped, count_error = counts.get(root_id, (None, False, None))
+        roots.append({"root_id": root_id, "pattern": pattern,
+                      "paths_held": paths, "paths_held_capped": capped,
+                      "error": count_error})
+    return {
+        "error": error,
+        "store_error": store_error,
+        "configured": roots,
+        "refused_lines": [{"line": line, "reason": reason} for line, reason in refusals],
+        # The daemon's own expansion of those patterns. A single `--watch
+        # worktrees=/…/worktrees/*` line becomes one root per directory, so the
+        # count of lines above and the count of roots the daemon holds are
+        # different numbers and neither substitutes for the other.
+        "expanded": state.get("watch_roots"),
+        "expanded_refused": state.get("watch_roots_refused"),
+        # Store subtrees whose id no longer appears in the watchlist: history
+        # that is KEPT and is no longer being added to. Saying so is the
+        # difference between "my old repo is still protected" and the truth.
+        "unwatched_root_ids": [i for i in ids if i not in configured_ids],
+    }
+
+
+def format_status(payload):
+    """The few lines a human reads at a glance. Never raises."""
+    lines = []
+    health = payload["health"]
+    lines.append("dhu-backup: %s" % health["sentence"])
+    lines.append("  daemon       %s (%s)" % (health["verdict"], health["detail"]))
+
+    last = payload.get("last_capture")
+    if last:
+        lines.append("  last capture %s (%ds ago)" % (last["iso"], last["age_seconds"]))
+    else:
+        lines.append("  last capture not recorded — the heartbeat names no last_scan_epoch")
+    lines.append("  install root %s" % payload["install_root"])
+
+    lines.extend(_format_watch_roots(payload.get("watch_roots")))
+
+    store = payload.get("store")
+    if store:
+        lines.append("  store        %s of its %s ceiling (%s left)"
+                     % (store["human"], store["ceiling_human"], store["headroom_human"]))
+    else:
+        lines.append("  store        size not reported by the heartbeat")
+    free = payload.get("free_space")
+    if free:
+        lines.append("  free space   %s on this volume; capture stops below %s (%s left)"
+                     % (free["human"], free["floor_human"], free["headroom_human"]))
+    else:
+        lines.append("  free space   not measured this cycle (the daemon reports why itself)")
+
+    warning = payload.get("warning")
+    if warning:
+        lines.append("  warning      %s" % ", ".join(warning["reasons"]))
+        lines.append("               %s" % warning["detail"])
+
+    for label, key in (("exclusions  ", "exclusions"), ("vault extras", "vault_extra")):
+        globs = payload.get(key)
+        if globs:
+            lines.append("  %s %d glob(s) in force, %d refused"
+                         % (label, globs["globs"], globs["refused"]))
+
+    step = payload.get("next_step") or {}
+    if step.get("command"):
+        lines.append("")
+        lines.append("  %s" % step["sentence"])
+        lines.append("    %s" % step["command"])
+    return "\n".join(lines)
+
+
+def _format_watch_roots(roots):
+    if not roots:
+        return ["  watch roots  not determined"]
+    lines = []
+    if roots["error"]:
+        # The one answer this must never give is an empty list, which reads as
+        # "nothing is watched" — the opposite claim from "I could not look".
+        lines.append("  watch roots  COULD NOT BE READ: %s" % roots["error"])
+        return lines
+    expanded = roots.get("expanded")
+    refused = roots.get("expanded_refused")
+    suffix = ""
+    if isinstance(expanded, int):
+        suffix = "; the daemon holds %d expanded root(s), %s refused" % (
+            expanded, refused if isinstance(refused, int) else "?")
+    lines.append("  watch roots  %d in etc/watchlist.conf%s"
+                 % (len(roots["configured"]), suffix))
+    for root in roots["configured"]:
+        if root["error"]:
+            held = "paths held UNKNOWN: %s" % root["error"]
+        elif root["paths_held"] is None:
+            held = "paths held not counted"
+        else:
+            held = "%s%s path(s) held" % ("at least " if root["paths_held_capped"] else "",
+                                          "{:,}".format(root["paths_held"]))
+        lines.append("    %-12s %s" % (root["root_id"], root["pattern"]))
+        lines.append("    %-12s %s" % ("", held))
+    if roots["configured"]:
+        lines.append("               (a count of PATHS, not of versions)")
+    for refusal in roots["refused_lines"]:
+        lines.append("  !! watchlist line refused (%s): %s"
+                     % (refusal["reason"], refusal["line"]))
+    if roots["store_error"]:
+        lines.append("  !! %s" % roots["store_error"])
+    if roots["unwatched_root_ids"]:
+        lines.append("  note         the store also holds %d root id(s) the watchlist no "
+                     "longer names: %s"
+                     % (len(roots["unwatched_root_ids"]),
+                        ", ".join(roots["unwatched_root_ids"])))
+        lines.append("               their captured versions are KEPT; nothing under them "
+                     "is being watched now.")
+    return lines
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 
@@ -443,6 +870,22 @@ def command_missing(args):
     return dhu_backup_core.announce_exit_code(result.status)
 
 
+def command_status(args):
+    """"Is this working?" — the everyday question, answered without sudo.
+
+    Exit code is the daemon's health, not this command's success: 0 capturing,
+    1 not capturing, 2 could not determine. `status` itself succeeding while
+    capture has stopped is the report nobody should be able to write a green
+    monitor against.
+    """
+    payload = status_payload(args.install_root)
+    if args.json:
+        _emit_json(payload)
+    else:
+        print(format_status(payload))
+    return payload["exit_code"]
+
+
 def _restore_one(entry, version, args):
     verdict = dhu_backup_core.restore_target(entry["relpath"], entry["watch_root"], args.into)
     if isinstance(verdict, Refuse):
@@ -636,6 +1079,10 @@ def main(argv=None):
     parser.add_argument("--quiet", action="store_true", help="suppress the health banner")
     subparsers = parser.add_subparsers(dest="command")
 
+    status = subparsers.add_parser(
+        "status", help="is this working? the health verdict, the roots, the budgets")
+    status.add_argument("--json", action="store_true", help="machine-readable output")
+
     lister = subparsers.add_parser("ls", help="which protected paths have versions")
     lister.add_argument("substring", nargs="?", default=None)
     lister.add_argument("--json", action="store_true", help="machine-readable output")
@@ -675,12 +1122,14 @@ def main(argv=None):
     # make every `--json` answer unparseable, so callers would pass `--quiet`
     # and stop seeing health at all. In JSON mode the same verdict is a `health`
     # FIELD of the object instead — carried, never dropped.
-    if not args.quiet and not getattr(args, "json", False) and args.command != "missing":
-        # `missing` states the health itself, in the same block as its answer.
-        # Printing the banner as well said it twice in different words, which
-        # reads as two findings rather than one.
+    if (not args.quiet and not getattr(args, "json", False)
+            and args.command not in ("missing", "status")):
+        # `missing` and `status` state the health themselves, in the same block
+        # as their answer. Printing the banner as well said it twice in
+        # different words, which reads as two findings rather than one.
         print_health_banner(args.install_root)
     return {
+        "status": command_status,
         "ls": command_ls,
         "log": command_log,
         "cat": command_cat,

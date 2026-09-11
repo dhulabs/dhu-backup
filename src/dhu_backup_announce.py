@@ -120,21 +120,34 @@ def _read_roots(install_root):
     return good, None
 
 
-def _read_health(install_root, now_epoch):
-    """`Health(verdict, detail)` for the daemon. Never raises."""
+def read_state(install_root, now_epoch):
+    """`(state, health)` — the parsed heartbeat AND its verdict, from ONE read.
+
+    `state` is the raw dict, or None when there was nothing to parse. Callers
+    that want only the verdict use `_read_health`, which is this function; the
+    pair exists because `dhu-backup status` reports the store size, the free
+    space and the glob counts that live in the SAME file the verdict came from,
+    and reading it twice can hand a reader a verdict from one heartbeat beside
+    numbers from the next. Never raises.
+    """
     path = os.path.join(install_root, "var", "state.json")
     try:
         with open(path) as handle:
             state = json.load(handle)
     except (IOError, OSError) as exc:
-        return dhu_backup_core.health_verdict(
+        return None, dhu_backup_core.health_verdict(
             None, now_epoch, error_kind="missing",
             error_detail="no heartbeat at %s (%s)" % (path, _errtext(exc, path)))
     except ValueError as exc:
-        return dhu_backup_core.health_verdict(
+        return None, dhu_backup_core.health_verdict(
             None, now_epoch, error_kind="unreadable",
             error_detail="heartbeat at %s did not parse: %s" % (path, exc))
-    return dhu_backup_core.health_verdict(state, now_epoch)
+    return state, dhu_backup_core.health_verdict(state, now_epoch)
+
+
+def _read_health(install_root, now_epoch):
+    """`Health(verdict, detail)` for the daemon. Never raises."""
+    return read_state(install_root, now_epoch)[1]
 
 
 def _errtext(exc, path):
@@ -348,6 +361,36 @@ _HEALTH_NOTE = {
     "no-heartbeat": "!! NO HEARTBEAT — DHU Backup may not be installed",
     "unreadable-heartbeat": "!! HEARTBEAT UNREADABLE — capture status UNKNOWN",
 }
+
+
+#: The sentence `dhu-backup status` prints for `ok`, and the one verdict
+#: `_HEALTH_NOTE` deliberately has no entry for. That table is the list of
+#: verdicts worth SHOUTING about on the hot path, and `format_text` prints an
+#: entry the moment it finds one — so putting `ok` in it would hang a banner
+#: over every announcement that has nothing wrong with it. Keeping the ok
+#: sentence here, beside the table rather than in a second module, is what makes
+#: `health_sentence` one vocabulary rather than two.
+HEALTH_OK_SENTENCE = "OK — capture is running and the store is being written"
+
+
+def health_sentence(verdict):
+    """One sentence for any `dhu_backup_core.HEALTH_VERDICTS` member. PURE.
+
+    The text is `_HEALTH_NOTE`'s, verbatim, "!!" and all: `status` says the
+    same words about a degraded daemon that a failed read says, because an
+    operator who has seen one should recognise the other.
+
+    An unknown verdict raises, as `announce_exit_code` does for an unknown
+    status. `health_verdict` cannot produce one, so reaching here means this
+    file and the vocabulary have gone out of step, and saying nothing about a
+    verdict we do not know is how `ok` gets printed over a stopped daemon.
+    """
+    if verdict == "ok":
+        return HEALTH_OK_SENTENCE
+    note = _HEALTH_NOTE.get(verdict)
+    if note is None:
+        raise ValueError("unknown health verdict: %r" % (verdict,))
+    return note
 
 
 def format_text(result):

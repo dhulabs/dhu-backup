@@ -725,12 +725,13 @@ class McpServerTests(FixtureCase):
         self.assertEqual(result["serverInfo"]["name"], "dhu-backup")
         self.assertTrue(result["serverInfo"]["version"])
 
-    def test_tools_list_returns_six_tools_each_with_a_schema(self):
+    def test_tools_list_returns_seven_tools_each_with_a_schema(self):
         _done, responses = self.converse([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
         tools = responses[0]["result"]["tools"]
         self.assertEqual([t["name"] for t in tools],
-                         ["dhu_backup_missing", "dhu_backup_ls", "dhu_backup_log",
-                          "dhu_backup_cat", "dhu_backup_restore", "dhu_backup_restore_dir"])
+                         ["dhu_backup_status", "dhu_backup_missing", "dhu_backup_ls",
+                          "dhu_backup_log", "dhu_backup_cat", "dhu_backup_restore",
+                          "dhu_backup_restore_dir"])
         for tool in tools:
             self.assertTrue(tool["description"])
             self.assertEqual(tool["inputSchema"]["type"], "object")
@@ -1170,3 +1171,337 @@ class WarningMcpToolTests(FixtureCase):
         for response in responses:
             payload = json.loads(response["result"]["content"][0]["text"])
             self.assertEqual(self.verdict_of(payload), "ok", payload)
+
+
+# ── `dhu-backup status`: the everyday question ────────────────────────────────
+
+
+class HealthSentenceTests(unittest.TestCase):
+    """One health vocabulary, not two.
+
+    `status` says the same words about a stopped daemon that a failed read
+    says. A second wording would be a second answer to the same question, and
+    the day the two disagreed the reader would believe the friendlier one.
+    """
+
+    def test_every_health_verdict_has_a_sentence(self):
+        for verdict in dhu_backup_core.HEALTH_VERDICTS:
+            self.assertTrue(dhu_backup_announce.health_sentence(verdict), verdict)
+
+    def test_the_sentences_are_the_announce_vocabulary_verbatim(self):
+        for verdict, note in dhu_backup_announce._HEALTH_NOTE.items():
+            self.assertEqual(dhu_backup_announce.health_sentence(verdict), note, verdict)
+
+    def test_ok_is_deliberately_absent_from_the_hot_path_table(self):
+        """`format_text` prints a `_HEALTH_NOTE` entry the moment it finds one.
+
+        An `ok` entry there would hang a banner over every announcement that
+        has nothing wrong with it, so the ok sentence lives beside the table
+        instead of in it.
+        """
+        self.assertNotIn("ok", dhu_backup_announce._HEALTH_NOTE)
+        self.assertEqual(dhu_backup_announce.health_sentence("ok"),
+                         dhu_backup_announce.HEALTH_OK_SENTENCE)
+
+    def test_an_unknown_verdict_raises_rather_than_saying_nothing(self):
+        with self.assertRaises(ValueError):
+            dhu_backup_announce.health_sentence("brand-new-state")
+
+
+class ReadStateTests(FixtureCase):
+    """The verdict and the numbers come out of ONE read of the heartbeat."""
+
+    def test_it_returns_both_the_raw_state_and_the_verdict(self):
+        state, health = dhu_backup_announce.read_state(self.install_root, time.time())
+        self.assertEqual(health.verdict, "ok")
+        self.assertEqual(state["files_scanned"], 4)
+
+    def test_a_missing_heartbeat_gives_no_state_and_a_report(self):
+        write_state(self.install_root, None)
+        state, health = dhu_backup_announce.read_state(self.install_root, time.time())
+        self.assertIsNone(state)
+        self.assertEqual(health.verdict, "no-heartbeat")
+
+    def test_read_health_is_the_same_function(self):
+        """Kept as one implementation so the two cannot drift."""
+        health = dhu_backup_announce._read_health(self.install_root, time.time())
+        self.assertEqual(health, dhu_backup_announce.read_state(
+            self.install_root, time.time())[1])
+
+
+class StatusPayloadTests(FixtureCase):
+    """The data `status` reports, against a fabricated install root."""
+
+    def setUp(self):
+        super(StatusPayloadTests, self).setUp()
+        self.helper = load_helper_module()
+        self.write_watchlist("repo        %s\nworktrees   %s\n"
+                             % (FIXTURE_REPO, FIXTURE_WORKTREE))
+
+    def write_watchlist(self, text):
+        path = os.path.join(self.install_root, "etc", "watchlist.conf")
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    def payload(self, **kwargs):
+        return self.helper.status_payload(self.install_root, platform_string="darwin",
+                                          **kwargs)
+
+    def test_a_healthy_install_reports_capturing_and_exits_zero(self):
+        payload = self.payload()
+        self.assertEqual(payload["health"]["verdict"], "ok")
+        self.assertTrue(payload["capturing"])
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertIsNone(payload["next_step"]["command"])
+
+    def test_it_counts_PATHS_not_versions(self):
+        """`lib/heartbeat.ts` has three versions in the fixture and counts once.
+
+        The number is read as "how much of my work is in there", and
+        versions-per-path is a retention setting, not an amount of work.
+        """
+        roots = {r["root_id"]: r for r in self.payload()["watch_roots"]["configured"]}
+        self.assertEqual(roots["repo"]["paths_held"], 3)
+        self.assertFalse(roots["repo"]["paths_held_capped"])
+        self.assertEqual(roots["worktrees"]["paths_held"], 1)
+
+    def test_a_spent_budget_reports_at_least_rather_than_a_wrong_number(self):
+        payload = self.payload(budget=1)
+        roots = {r["root_id"]: r for r in payload["watch_roots"]["configured"]}
+        self.assertTrue(roots["repo"]["paths_held_capped"])
+        self.assertLessEqual(roots["repo"]["paths_held"], 3)
+        self.assertIn("at least", self.helper.format_status(payload))
+
+    def test_the_budget_is_handed_back_when_a_root_does_not_spend_it(self):
+        """A first root with a small history must not burn the whole allowance.
+
+        With a budget of 5 and four version directories under `repo`, the
+        second root still has enough left to be counted exactly.
+        """
+        payload = self.payload(budget=6)
+        roots = {r["root_id"]: r for r in payload["watch_roots"]["configured"]}
+        self.assertFalse(roots["worktrees"]["paths_held_capped"])
+        self.assertEqual(roots["worktrees"]["paths_held"], 1)
+
+    def test_a_root_with_nothing_captured_yet_reports_zero_not_an_error(self):
+        self.write_watchlist("fresh  /Users/fixture/brand-new\n")
+        roots = self.payload()["watch_roots"]["configured"]
+        self.assertEqual(roots[0]["paths_held"], 0)
+        self.assertIsNone(roots[0]["error"])
+
+    def test_an_unreadable_watchlist_is_reported_never_read_as_no_roots(self):
+        """"I could not look" and "nothing is watched" are opposite claims."""
+        os.unlink(os.path.join(self.install_root, "etc", "watchlist.conf"))
+        payload = self.payload()
+        self.assertIn("watchlist-unreadable", payload["watch_roots"]["error"])
+        self.assertEqual(payload["watch_roots"]["configured"], [])
+        self.assertIn("COULD NOT BE READ", self.helper.format_status(payload))
+
+    def test_a_refused_watchlist_line_is_carried_not_dropped(self):
+        self.write_watchlist("repo  %s\nBAD LINE HERE\n" % FIXTURE_REPO)
+        payload = self.payload()
+        self.assertEqual(len(payload["watch_roots"]["refused_lines"]), 1)
+        self.assertIn("refused", self.helper.format_status(payload))
+
+    def test_store_ids_the_watchlist_no_longer_names_are_reported_as_kept(self):
+        """History for a root that was removed is KEPT and is not being added to.
+
+        Saying nothing here is the difference between an operator believing
+        their old repo is still protected and knowing that it is not.
+        """
+        self.write_watchlist("repo  %s\n" % FIXTURE_REPO)
+        payload = self.payload()
+        self.assertEqual(payload["watch_roots"]["unwatched_root_ids"], ["worktrees"])
+        self.assertIn("no longer names", self.helper.format_status(payload))
+
+    def test_the_budgets_come_from_the_heartbeat_not_from_the_defaults(self):
+        """Raising `max_store_bytes` is the documented way out of DEGRADED.
+
+        A status that measured headroom against the compiled-in default would
+        print the wrong number on exactly the machine where somebody acted on
+        the last one.
+        """
+        state = fresh_ok_state()
+        state.update({"store_bytes": 100, "max_store_bytes": 1000,
+                      "free_bytes": 900, "min_free_bytes": 400})
+        write_state(self.install_root, state)
+        payload = self.payload()
+        self.assertEqual(payload["store"]["ceiling_bytes"], 1000)
+        self.assertEqual(payload["store"]["headroom_bytes"], 900)
+        self.assertEqual(payload["free_space"]["floor_bytes"], 400)
+        self.assertEqual(payload["free_space"]["headroom_bytes"], 500)
+
+    def test_an_unmeasured_free_space_is_said_rather_than_shown_as_zero(self):
+        state = fresh_ok_state()
+        state["free_bytes"] = None
+        write_state(self.install_root, state)
+        payload = self.payload()
+        self.assertIsNone(payload["free_space"])
+        self.assertIn("not measured this cycle", self.helper.format_status(payload))
+
+    def test_a_warning_carries_its_reasons_and_what_is_left(self):
+        state = fresh_ok_state()
+        state.update({"state": "warning",
+                      "warning_reason": ["free-space-low"],
+                      "warning_detail": "11.0 GiB free, and capture stops at 10.0 GiB",
+                      "store_bytes": 10, "free_bytes": 11 * 1024 ** 3})
+        write_state(self.install_root, state)
+        payload = self.payload()
+        self.assertEqual(payload["health"]["verdict"], "warning")
+        self.assertTrue(payload["capturing"])
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertEqual(payload["warning"]["reasons"], ["free-space-low"])
+        text = self.helper.format_status(payload)
+        self.assertIn("capture stops at 10.0 GiB", text)
+        self.assertIn("kickstart", text)          # the one command to type
+
+    def test_a_degraded_daemon_exits_one_and_names_the_remedy(self):
+        state = fresh_ok_state()
+        state.update({"state": "degraded", "degraded_reason": "store-ceiling"})
+        write_state(self.install_root, state)
+        payload = self.payload()
+        self.assertEqual(payload["exit_code"], 1)
+        self.assertFalse(payload["capturing"])
+        self.assertIn("store-ceiling", payload["health"]["detail"])
+        self.assertIn("dhu-backupd.conf", payload["next_step"]["sentence"])
+
+    def test_no_heartbeat_exits_two_because_the_status_is_UNKNOWN(self):
+        write_state(self.install_root, None)
+        payload = self.payload()
+        self.assertEqual(payload["exit_code"], 2)
+        self.assertEqual(payload["health"]["verdict"], "no-heartbeat")
+
+    def test_glob_counts_appear_only_when_there_are_any(self):
+        self.assertIsNone(self.payload()["exclusions"])
+        state = fresh_ok_state()
+        state.update({"exclude_globs": 2, "exclude_refused": 1,
+                      "vault_extra_globs": 3, "vault_extra_refused": 0})
+        write_state(self.install_root, state)
+        payload = self.payload()
+        self.assertEqual(payload["exclusions"], {"globs": 2, "refused": 1})
+        self.assertEqual(payload["vault_extra"], {"globs": 3, "refused": 0})
+        text = self.helper.format_status(payload)
+        self.assertIn("2 glob(s) in force, 1 refused", text)
+
+    def test_refused_globs_with_none_in_force_are_still_reported(self):
+        """Every line the operator wrote was thrown out — the one case here
+        worth printing, and the one a `if not globs` check would hide."""
+        state = fresh_ok_state()
+        state.update({"exclude_globs": 0, "exclude_refused": 4})
+        write_state(self.install_root, state)
+        self.assertEqual(self.payload()["exclusions"], {"globs": 0, "refused": 4})
+
+    def test_it_never_raises_on_a_broken_install_root(self):
+        for root in ("/nonexistent-xyz", "", None, 12):
+            payload = self.helper.status_payload(root, platform_string="darwin")
+            self.assertIn(payload["exit_code"], (1, 2), repr(root))
+            self.assertTrue(self.helper.format_status(payload), repr(root))
+
+    def test_a_garbled_heartbeat_is_unreadable_not_ok(self):
+        write_state(self.install_root, "{not json")
+        payload = self.payload()
+        self.assertEqual(payload["health"]["verdict"], "unreadable-heartbeat")
+        self.assertEqual(payload["exit_code"], 2)
+
+
+class StatusCliTests(FixtureCase):
+    """The subcommand, end to end, as a process."""
+
+    def setUp(self):
+        super(StatusCliTests, self).setUp()
+        with open(os.path.join(self.install_root, "etc", "watchlist.conf"), "w") as handle:
+            handle.write("repo  %s\n" % FIXTURE_REPO)
+
+    def status(self, *argv):
+        env = dict(os.environ, TZ="UTC")
+        return subprocess.run(
+            [PYTHON, "-E", "-s", "-S", HELPER, "--install-root", self.install_root,
+             "status"] + list(argv), capture_output=True, text=True, env=env)
+
+    def test_it_prints_a_verdict_a_root_and_the_budgets_and_exits_zero(self):
+        done = self.status()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("dhu-backup:", done.stdout)
+        self.assertIn("daemon       ok", done.stdout)
+        self.assertIn("watch roots", done.stdout)
+        self.assertIn("3 path(s) held", done.stdout)
+        self.assertIn("store", done.stdout)
+        self.assertEqual(done.stderr, "")
+
+    def test_the_health_banner_is_not_printed_twice(self):
+        """`status` states the health itself, in the same block as its answer.
+
+        The banner as well said it twice in different words, which reads as two
+        findings rather than one — the same reason `missing` suppresses it.
+        """
+        self.assertNotIn("!! ", self.status().stdout)
+
+    def test_json_mode_prints_one_parseable_object_carrying_the_exit_code(self):
+        done = self.status("--json")
+        payload = json.loads(done.stdout)
+        self.assertEqual(payload["exit_code"], done.returncode)
+        self.assertEqual(payload["health"]["verdict"], "ok")
+        self.assertTrue(payload["watch_roots"]["configured"])
+
+    def test_the_exit_code_follows_the_daemon_and_not_the_command(self):
+        """`status` succeeding while capture has stopped is a report nobody
+        should be able to write a green monitor against."""
+        write_state(self.install_root, dict(fresh_ok_state(), state="unprotected"))
+        self.assertEqual(self.status().returncode, 1)
+        write_state(self.install_root, None)
+        self.assertEqual(self.status().returncode, 2)
+
+    def test_it_needs_no_privilege_and_writes_nothing(self):
+        before = sorted(os.listdir(os.path.join(self.install_root, "var")))
+        self.status()
+        self.assertEqual(sorted(os.listdir(os.path.join(self.install_root, "var"))), before)
+
+
+class StatusMcpToolTests(FixtureCase):
+    """The same answer, over MCP, with no second implementation behind it."""
+
+    def setUp(self):
+        super(StatusMcpToolTests, self).setUp()
+        with open(os.path.join(self.install_root, "etc", "watchlist.conf"), "w") as handle:
+            handle.write("repo  %s\n" % FIXTURE_REPO)
+
+    def call_status(self):
+        env = dict(os.environ, TZ="UTC")
+        message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "dhu_backup_status", "arguments": {}}}
+        done = subprocess.run(
+            [PYTHON, "-E", "-s", "-S", MCP, "--install-root", self.install_root],
+            input=json.dumps(message) + "\n", capture_output=True, text=True, env=env)
+        return json.loads(done.stdout.splitlines()[0])["result"]
+
+    def test_it_returns_the_helper_payload_with_the_text_beside_it(self):
+        result = self.call_status()
+        payload = result["structuredContent"]
+        self.assertEqual(payload["health"]["verdict"], "ok")
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertIn("dhu-backup:", payload["text"])
+        self.assertFalse(result["isError"])
+
+    def test_a_stopped_daemon_is_an_ANSWER_and_not_a_protocol_error(self):
+        """The answer the caller most needs must not arrive as an error a
+        client might retry or drop."""
+        write_state(self.install_root, dict(fresh_ok_state(), state="degraded",
+                                            degraded_reason="store-ceiling"))
+        result = self.call_status()
+        self.assertFalse(result["isError"])
+        self.assertEqual(result["structuredContent"]["exit_code"], 1)
+
+    def test_a_status_that_cannot_be_determined_is_an_error(self):
+        write_state(self.install_root, None)
+        result = self.call_status()
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["structuredContent"]["exit_code"], 2)
+
+    def test_it_is_annotated_read_only(self):
+        """Asserted here as well as in the annotation sweep, because this is the
+        tool an agent is most likely to call unprompted."""
+        spec = importlib.util.spec_from_file_location("dhu_backup_mcp_status", MCP)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        tool = [t for t in module.TOOLS if t["name"] == "dhu_backup_status"][0]
+        self.assertEqual(tool["annotations"], module.READ_ONLY)

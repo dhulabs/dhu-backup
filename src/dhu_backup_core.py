@@ -730,14 +730,14 @@ def budget_warning(store_bytes, free_bytes, limits=DEFAULT_LIMITS):
             reasons.append("free-space-low")
             sentences.append(
                 "%s free, and capture stops at %s"
-                % (_human_bytes(free_bytes), _human_bytes(limits.min_free_bytes))
+                % (human_bytes(free_bytes), human_bytes(limits.min_free_bytes))
             )
     store_threshold = int(limits.max_store_bytes * STORE_WARNING_FRACTION)
     if store_bytes > store_threshold:
         reasons.append("store-nearly-full")
         sentences.append(
             "the store holds %s of its %s ceiling"
-            % (_human_bytes(store_bytes), _human_bytes(limits.max_store_bytes))
+            % (human_bytes(store_bytes), human_bytes(limits.max_store_bytes))
         )
     if not reasons:
         return None
@@ -749,8 +749,37 @@ def budget_warning(store_bytes, free_bytes, limits=DEFAULT_LIMITS):
     )
 
 
-def _human_bytes(byte_count):
+#: What is LEFT before each of the two store-wide budgets stops capture.
+#: Either field is None when the number it needs was not measured — never 0,
+#: which reads as "no headroom at all" and is the fabricated-reason defect the
+#: daemon already shipped once (a failed `statvfs` became `free_bytes = 0`).
+BudgetHeadroom = namedtuple("BudgetHeadroom", "store_left free_left")
+
+
+def budget_headroom(store_bytes, free_bytes, limits=DEFAULT_LIMITS):
+    """`BudgetHeadroom(store_left, free_left)` — how much room is left. PURE.
+
+    Not a gate and not a warning: `budget_decision` decides and
+    `budget_warning` forecasts. This answers the question a human asks on
+    reading either of them — *how much have I got?* — and it is the number
+    `dhu-backup status` prints beside a `warning` verdict.
+
+    Both values may be NEGATIVE, and are reported that way rather than clamped
+    at zero. A store already over its ceiling and a store exactly at it are
+    different facts, and only the first tells the operator how much to free.
+    """
+    store_left = limits.max_store_bytes - store_bytes
+    free_left = None if free_bytes is None else free_bytes - limits.min_free_bytes
+    return BudgetHeadroom(store_left=store_left, free_left=free_left)
+
+
+def human_bytes(byte_count):
     """A byte count as a sentence fragment. Never used for a decision.
+
+    Public rather than private because `dhu-backup status` renders the same
+    three numbers the heartbeat reports — store size, free space, and the two
+    budgets they are heading for — and a second byte formatter would print
+    "0.7 GB" beside this one's "733.4 MiB" for the same store.
 
     Scaled rather than fixed at GiB. A staging run with a fabricated 1,100-byte
     ceiling printed "the store holds 0.0 GiB of its 0.0 GiB ceiling", which is a
@@ -1204,6 +1233,143 @@ def announce_exit_code(status):
     if status in ANNOUNCE_STATUSES:
         return 1
     raise ValueError("unknown announce status: %r" % (status,))
+
+
+# ── `dhu-backup status`: is this working, and if not, what do I type? ─────────
+#
+# One question, asked of the same health verdict everything else here reports.
+# The vocabulary is NOT extended: `status` adds an exit code and a next step per
+# verdict and nothing else, because a second health vocabulary is two answers to
+# one question, and the day they disagree the reader believes the friendlier one.
+
+#: The verdicts under which capture IS happening. `warning` is here on purpose:
+#: it means "capturing, and close to a budget that will stop it", so a monitor
+#: that failed on it would be failing over something that has not happened yet.
+#: They still are not merged — they carry different sentences and a `warning`
+#: prints what is left before the stop; they share an exit code, nothing more.
+CAPTURING_VERDICTS = ("ok", "warning")
+
+#: The verdicts under which capture is NOT happening and a human must act. The
+#: first three are the daemon reporting its own stop; `stale` is the heartbeat
+#: being too old to support any claim that capture is still running.
+NOT_CAPTURING_VERDICTS = ("degraded", "unprotected", "scan-failed", "stale")
+
+#: The verdicts that are neither, because the status could not be DETERMINED.
+#: Kept apart from `NOT_CAPTURING_VERDICTS` for the reason `store-unavailable`
+#: is kept apart from `not-held`: "capture has stopped" and "I could not find
+#: out whether capture has stopped" are opposite claims, and a caller that
+#: collapses them either pages for a machine that is fine or stays quiet about
+#: one that is not.
+UNDETERMINED_VERDICTS = ("no-heartbeat", "unreadable-heartbeat")
+
+
+def status_exit_code(verdict):
+    """Process exit code for `dhu-backup status`. PURE. Three codes.
+
+    0 capturing (`ok`, `warning`) · 1 not capturing · 2 could not determine.
+
+    An unknown verdict RAISES rather than defaulting to any of the three. A
+    verdict added to `HEALTH_VERDICTS` without being placed in one of the three
+    tuples above is a decision nobody made, and the failure directions are not
+    symmetric: defaulting to 0 would report a healthy machine on a state this
+    version does not understand.
+    """
+    if verdict in CAPTURING_VERDICTS:
+        return 0
+    if verdict in NOT_CAPTURING_VERDICTS:
+        return 1
+    if verdict in UNDETERMINED_VERDICTS:
+        return 2
+    raise ValueError("unknown health verdict: %r" % (verdict,))
+
+
+#: `install.sh` has its own copy of the restart command (`service_restart_hint`)
+#: and a test asserts the two produce the same string on both platforms.
+#: Duplicated the way `DEFAULT_INSTALL_ROOTS` is duplicated, and for the same
+#: reason: the installer cannot import a Python table, and a restart command
+#: naming the wrong service manager is advice that fails in front of an operator
+#: who is already having a bad day. The status commands below have no shell twin
+#: — `service_status_hint` there prints a compound of two commands for systemd —
+#: so only the service NAME is asserted common.
+SERVICE_RESTART_COMMANDS = {
+    "darwin": "sudo launchctl kickstart -k system/com.dhulabs.backup",
+    "linux": "sudo systemctl restart dhu-backupd.service",
+}
+
+SERVICE_STATUS_COMMANDS = {
+    "darwin": "sudo launchctl print system/com.dhulabs.backup",
+    "linux": "systemctl status dhu-backupd.service",
+}
+
+
+def service_restart_command(platform_string):
+    """The command that restarts the daemon on this platform. PURE."""
+    key = "linux" if platform_string.startswith("linux") else "darwin"
+    return SERVICE_RESTART_COMMANDS[key]
+
+
+def service_status_command(platform_string):
+    """The command that asks the service manager about the daemon. PURE."""
+    key = "linux" if platform_string.startswith("linux") else "darwin"
+    return SERVICE_STATUS_COMMANDS[key]
+
+
+#: `sentence` says what is wrong in the operator's terms; `command` is the ONE
+#: thing to type. `command` is None only for `ok`, where there is nothing to do.
+NextStep = namedtuple("NextStep", "sentence command")
+
+
+def status_next_step(verdict, install_root, platform_string):
+    """`NextStep(sentence, command)` for one health verdict. PURE.
+
+    Every verdict in `HEALTH_VERDICTS` has an entry, including `ok`, and an
+    unknown one raises. "Something is wrong" without "here is what to type"
+    is the state this command exists to end: the information was always in
+    `var/state.json`, and reading JSON at the moment your work has vanished is
+    not a recovery procedure.
+    """
+    config = os.path.join(install_root, "etc", "dhu-backupd.conf")
+    log = os.path.join(install_root, "var", "dhu-backupd.log")
+    state = os.path.join(install_root, "var", "state.json")
+    restart = service_restart_command(platform_string)
+
+    if verdict == "ok":
+        return NextStep(None, None)
+    if verdict == "warning":
+        return NextStep(
+            "Act now rather than then: capture stopping never self-heals. Free space "
+            "on this volume, or raise min_free_bytes / max_store_bytes in %s and "
+            "restart:" % config, restart)
+    if verdict == "degraded":
+        return NextStep(
+            "Capture has stopped and will not restart itself. Free space on this "
+            "volume, or raise min_free_bytes / max_store_bytes in %s, then restart:"
+            % config, restart)
+    if verdict == "unprotected":
+        return NextStep(
+            "The daemon is running and has no usable watch root, so nothing is being "
+            "protected. Name the directories to protect (the refusal reason for each "
+            "root is in %s):" % log,
+            "sudo bash install.sh --watch id=/abs/path")
+    if verdict == "scan-failed":
+        return NextStep("Every scan is throwing. The exception is in the daemon's log:",
+                        "sudo tail -50 %s" % log)
+    if verdict == "stale":
+        return NextStep(
+            "The heartbeat is too old to support any claim that capture is running. "
+            "Ask the service manager whether the daemon is alive:",
+            service_status_command(platform_string))
+    if verdict == "no-heartbeat":
+        return NextStep(
+            "There is no heartbeat at %s, so DHU Backup may not be installed here. "
+            "Install it, naming what to protect:" % state,
+            "sudo bash src/install.sh --watch id=/abs/path")
+    if verdict == "unreadable-heartbeat":
+        return NextStep(
+            "The heartbeat is present and this version cannot interpret it — a "
+            "truncated write, or a daemon newer than this helper. Read it yourself:",
+            "cat %s" % state)
+    raise ValueError("unknown health verdict: %r" % (verdict,))
 
 
 def health_verdict(state, now_epoch, error_kind=None, error_detail=None):
