@@ -1623,6 +1623,36 @@ class WatchSuggestionFormatTest(unittest.TestCase):
         out = self.suggest("/home/a/my side project")
         self.assertIn("--watch 'my-side-project=/home/a/my side project'", out)
 
+    def test_a_single_quote_in_a_path_cannot_escape_the_quoting(self):
+        """A directory named proj'$(cmd)'x under the home, planted by an agent.
+
+        Wrapped in bare quotes, the $(cmd) sat OUTSIDE them in the line the
+        human was told to run with sudo — root code execution through the
+        operator's paste (independent review, 2026-09-11). The paste-ready
+        line must tokenise back to the exact path, with the substitution
+        inert inside it.
+        """
+        import shlex
+        hostile = "/home/a/proj'$(id>/tmp/PWNED)'x"
+        out = self.suggest(hostile)
+        line = [l for l in out.splitlines() if "sudo bash install.sh" in l][0]
+        tokens = shlex.split(line.strip())
+        flags = [t for t in tokens if t.endswith("=" + hostile)]
+        self.assertEqual(len(flags), 1, tokens)
+        self.assertIn("'\\''", line)
+
+    def test_a_name_with_control_characters_is_omitted_and_said(self):
+        out = self.suggest("/home/a/\x1b]0;PWNED\x07proj", "/home/a/ok")
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("PWNED", out)
+        self.assertIn("1 candidate(s) omitted", out)
+        self.assertIn("--watch 'ok=/home/a/ok'", out)
+
+    def test_only_omitted_candidates_leaves_nothing_to_paste(self):
+        out = self.suggest("/home/a/bad\nname")
+        self.assertIn("omitted", out)
+        self.assertNotIn("sudo bash install.sh", out)
+
     def test_a_glob_path_is_quoted_so_pasting_cannot_expand_it(self):
         """The same rule uninstall.sh follows, for the same reason: unquoted,
         the pasting shell would expand it against its own cwd."""

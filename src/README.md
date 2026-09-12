@@ -391,10 +391,11 @@ The same layout on both platforms; only the root differs
   store/                  0755 root:wheel   AGENT-READABLE — guard-clean files
   vault/                  0700 root:wheel   root-only — credential-class files
   var/roots/              0755 root:wheel   which absolute path each root-id/slug is
-  var/index.sqlite3       0644 root:wheel   change detection only
+  var/index.sqlite3       0644 root:wheel   change detection only (a cache: a
+                                            corrupted one is moved aside and rebuilt)
   var/state.json          0644 root:wheel   heartbeat: counts and state, no paths
   var/dhu-backupd.log     0644 root:wheel   decisions and paths, never content
-  var/tmp/                0700 root:wheel   staging for atomic writes
+  var/tmp/                0700 root:wheel   staging for atomic writes; swept at start
 ```
 
 Version layout, in both trees:
@@ -569,14 +570,40 @@ cat /Library/DHU/backup/var/state.json
   "files_scanned": 6253,
   "versions_written": 12,
   "bytes_written": 204800,
+  "content_already_held": 3,
+  "versions_rolled": 0,
   "files_deferred_by_throttle": 0,
   "refusals_by_reason": { "walk-symlink": 2, "admission-excluded-extension": 43 },
   "store_bytes": 91234567,
   "free_bytes": 30064771072,
+  "max_store_bytes": 5368709120,
+  "min_free_bytes": 10737418240,
   "watch_roots": 3,
-  "watch_roots_refused": 0
+  "watch_roots_refused": 0,
+  "directories_watched": 797,
+  "trigger": "kqueue",
+  "trigger_watch_failures": 0,
+  "interpreter_root_owned": true,
+  "interval_seconds": 15,
+  "retention_days": 30,
+  "exclude_globs": 0,
+  "exclude_refused": 0,
+  "vault_extra_globs": 0,
+  "vault_extra_refused": 0,
+  "vaulted": 0,
+  "prune_last_removed": 0,
+  "prune_last_failed": 0,
+  "index_reconciled": 0
 }
 ```
+
+Every count except `store_bytes`, `free_bytes` and the `*_last_*` ones is for
+the LAST SCAN, not cumulative. `versions_rolled` is how many versions the
+per-path window discarded in that scan; `content_already_held` how many files
+were re-hashed and found unchanged against their newest version; `vaulted` how
+many of the versions written went to `vault/`. Under `degraded` the heartbeat
+also carries `degraded_reason` and `degraded_since_epoch`; under `scan-failed`,
+`scan_error`.
 
 Three fields are about the machinery rather than the capture.
 `trigger` is the name of the trigger actually running — `kqueue`, `inotify` or
@@ -1040,7 +1067,7 @@ record. The daemon's own capture log is the authoritative one.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-635 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
+652 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
 platform-aware rather than platform-specific: it asserts THIS platform's install
 surface, and asserts the other platform's through `--dry-run --platform`, which
 is what that flag exists for. Three tests that assert the scripts refuse without

@@ -355,7 +355,7 @@ USAGE
 # a root shell for any agent. The Linux equivalents are a pyenv or conda python
 # under a home directory, and a /usr/bin/python3 symlink an agent can repoint.
 check_interpreter() {  # <interpreter-path> -> prints the reason, non-zero if refused
-  /usr/bin/python3 -E -s -S -c '
+  /usr/bin/python3 -E -s -S -B -c '
 import os, sys
 sys.path.insert(0, sys.argv[1])
 import dhu_backup_core
@@ -560,7 +560,7 @@ MAX_SUGGESTED_ROOTS=8
 # list rather than copied into a second one here. A copy would drift, and the
 # direction it drifts in is suggesting a watch root inside `node_modules`.
 builtin_excluded_dir_names() {
-  /usr/bin/python3 -E -s -S -c '
+  /usr/bin/python3 -E -s -S -B -c '
 import sys
 sys.path.insert(0, sys.argv[1])
 import dhu_backup_core
@@ -577,7 +577,7 @@ sys.stdout.write(" ".join(sorted(dhu_backup_core.EXCLUDED_DIR_NAMES)) + "\n")
 # and would protect nothing. A home that turns out to be root-owned is therefore
 # dropped, and the caller says so rather than printing an empty list.
 invoking_user_home() {
-  /usr/bin/python3 -E -s -S -c '
+  /usr/bin/python3 -E -s -S -B -c '
 import os, pwd, sys
 uid, user = sys.argv[1], sys.argv[2]
 home = ""
@@ -640,8 +640,14 @@ format_watch_suggestion() {  # <absolute-path>...
     echo "   Name the directories yourself: --watch id=/abs/path (repeatable)."
     return 0
   fi
+  local omitted=0
   for path in "$@"; do
     [ -n "$path" ] || continue
+    # A name carrying a control character is never suggested. An escape
+    # sequence in a directory name reaches the terminal raw and can recolour
+    # or retitle the line the operator is about to paste, and a newline would
+    # split it. Counted and said, not dropped in silence.
+    case "$path" in *[[:cntrl:]]*) omitted=$((omitted + 1)); continue ;; esac
     # The id comes from the last NON-glob component. `find_candidate_repos`
     # only ever yields concrete directories, but a hand-written
     # `/home/you/worktrees/*` has the basename `*`, which sanitises to nothing
@@ -665,9 +671,16 @@ format_watch_suggestion() {  # <absolute-path>...
       n=$((n + 1))
     done
     seen="$seen$candidate "
-    flags="$flags --watch '$candidate=$path'"
+    flags="$flags --watch $(shell_single_quote "$candidate=$path")"
     count=$((count + 1))
   done
+  if [ "$omitted" -gt 0 ]; then
+    echo "   $omitted candidate(s) omitted: the directory name contains control characters."
+  fi
+  if [ "$count" -eq 0 ]; then
+    echo "   Nothing left to suggest. Name the directories yourself: --watch id=/abs/path (repeatable)."
+    return 0
+  fi
   echo "   $count candidate(s) on this machine, most recently modified first."
   echo "   Read the list, delete what should not be protected, then run it:"
   echo
@@ -721,7 +734,7 @@ find_candidate_repos() {  # <home> [max]
 # list — a failure with nothing wrong, on exactly the machine with the most
 # repositories.
 sort_paths_by_mtime_desc() {  # <max>; paths on stdin
-  /usr/bin/python3 -E -s -S -c '
+  /usr/bin/python3 -E -s -S -B -c '
 import os, sys
 def mtime(path):
     try:
@@ -734,6 +747,15 @@ ordered = sorted(paths, key=mtime, reverse=True)
 for path in (ordered[:limit] if limit > 0 else ordered):
     sys.stdout.write(path + "\n")
 ' "${1:-0}"
+}
+
+# One argument, single-quoted for a shell, with every embedded quote closed,
+# escaped and re-opened: a'b becomes 'a'\''b'. Wrapping in bare quotes is not
+# enough — a directory named proj'$(cmd)'x, which an unprivileged agent can
+# create under the home directory, would put $(cmd) OUTSIDE the quotes of a
+# line the human is then told to run with sudo (independent review, 2026-09-11).
+shell_single_quote() {  # <text>
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
 # The glue: home directory, walk, formatting. The only part that is not testable

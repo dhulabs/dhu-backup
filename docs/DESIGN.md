@@ -94,6 +94,23 @@ limits tuple. A file is copied only if it is:
 | not setuid and not setgid | never propagate a privilege bit into the mirror |
 | at most 1 MiB | the population is text; a large file is a build artifact |
 | outside the excluded directories and extensions | matched *before* descending |
+| reachable by the owner | every directory on the way is one the owner could enter |
+
+The last row is what makes "the agent-readable half carries nothing the agent
+could not already read" true rather than assumed. Admission is decided on the
+FILE's uid, and a root daemon can enter any directory; so a file the owner
+owns, sitting under a root-owned `0700` directory, was mirrored to the
+world-readable store although the owner could not read the original
+(independent review, 2026-09-11, demonstrated live). `owner_can_traverse` is a
+pure function over a directory's stat: owner-owned is always enterable (the
+owner can chmod it), otherwise the owner needs group execute through one of its
+groups or other execute. It is applied to every watch-root component, to the
+root itself and to every directory the walk opens, on the fstat of the open fd.
+A directory the owner could not enter is refused and counted
+(`dir-not-traversable-by-owner`). A file the owner owns but cannot read — mode
+`0000`, say — is still mirrored: the owner can chmod it, so nothing new is
+disclosed to the owner, though it is disclosed to any other account that can
+read the store, which the split store already accepts for everything it holds.
 
 Everything else is a refusal carrying a reason, counted in the heartbeat under
 that reason and logged once per file per reason per process. Logging every
@@ -195,6 +212,10 @@ per directory ([PROOFS §6](PROOFS.md#6-the-independent-review-of-2026-09-11)).
 Every retention decision is now keyed on `(relpath-dir, leaf)`, and the daemon
 forgets any indexed path the store no longer holds a version of, so it is
 captured again on the next scan.
+
+The version key is kept monotonic per path: if the wall clock has stepped back
+behind a path's newest key, the new key is one past it, so a clock change can
+never make the newest capture the first one the window discards.
 
 The walk also refuses two shapes at the source, before they can reach the
 store: an entry whose **name parses as a version key**, which would otherwise

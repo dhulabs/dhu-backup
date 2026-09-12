@@ -212,6 +212,15 @@ print_kept_data_for() {  # <root> <store_size> <vault_size> <var_size>
 #
 # Read-only, and readable unprivileged: the file is 0644 by design. An absent
 # or unreadable one is REPORTED, never passed over in silence.
+# One argument, single-quoted for a shell, with every embedded quote closed,
+# escaped and re-opened: a'b becomes 'a'\''b'. Wrapping in bare quotes is not
+# enough — a directory named proj'$(cmd)'x, which an unprivileged agent can
+# create under the home directory, would put $(cmd) OUTSIDE the quotes of a
+# line the human is then told to run with sudo (independent review, 2026-09-11).
+shell_single_quote() {  # <text>
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 print_watch_roots_for() {  # <root>
   local root="$1" file="$1/etc/watchlist.conf" flags=""
   echo "the watch roots you are about to lose (etc/ is removed; store/ is not):"
@@ -231,7 +240,7 @@ print_watch_roots_for() {  # <root>
     # glob the watchlist permits) and may contain spaces; unquoted, the shell
     # that pastes this line would expand or split it, and the "ready to paste"
     # command would silently protect something other than what was protected.
-    flags="$flags --watch '$id=$path'"
+    flags="$flags --watch $(shell_single_quote "$id=$path")"
   done < "$file"
   if [ -z "$flags" ]; then
     echo "  none recorded — $file names no roots."

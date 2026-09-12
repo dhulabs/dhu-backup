@@ -6,7 +6,7 @@ document. Home directories have been generalised to `/Users/you` and
 `/home/you`; nothing else in the observed output is edited. The machines are not
 identified.
 
-What CI does prove, on every push, is that the 635-test suite passes on a clean
+What CI does prove, on every push, is that the 652-test suite passes on a clean
 `macos-latest` and `ubuntu-latest` runner with nothing from a developer's own
 machine. What CI cannot prove is anything that needs a root daemon actually
 installed, which is everything below.
@@ -265,7 +265,7 @@ indexed path the store no longer holds a version of, so it is captured again
 on the next scan. Versions the old window removed were removed; the source
 files were never touched.
 
-### Three more, each by execution
+### More, each by execution
 
 - **The content de-duplication never ran.** A 64-character digest was compared
   against a set of 12-character prefixes. `touch` on an unchanged file wrote a
@@ -285,6 +285,34 @@ files were never touched.
   "leaf" was a directory; `cat` on it raised `IsADirectoryError`. The walk
   refuses the shape (`walk-version-key-shaped`), the path check refuses it, and
   the reader requires a regular file where the leaf should be.
+
+- **The paste-ready `--watch` line could carry a command.** The installer's
+  suggestion wrapped each candidate path in bare single quotes. A git working
+  tree named `proj'$(id>/tmp/PWNED)'x` under the home — a name an
+  unprivileged agent can create — produced a line in which `$(id>/tmp/PWNED)`
+  sat outside the quotes, and tokenising it ran the substitution; pasted with
+  `sudo`, it would have run as root before the installer started. Terminal
+  escape sequences in names reached the terminal raw. Paths are now quoted
+  with every embedded quote closed and re-opened, and a name carrying a
+  control character is omitted and counted.
+- **An owner-owned file under a root-owned `0700` directory was mirrored
+  world-readable.** On the Linux install: `cat` on the original was refused,
+  and 25 seconds later the copy in `store/` read back with no sudo. The walk
+  now refuses any directory the owner could not enter, on the fstat of the
+  open fd, and the same rule applies to every watch-root component.
+- **A write that failed for want of space left an empty version directory and
+  an orphan staging file**, and nothing swept or reported them (simulated by
+  making `os.write` raise `ENOSPC`). The version directory is now created only
+  after the bytes are on disk, the staging file is removed on every failure,
+  and the daemon sweeps `var/tmp` at start and says how many it removed.
+- **A corrupted index was a restart every two seconds** with a frozen `ok`
+  heartbeat and no ERROR line, because `open_index` raised outside any
+  handler. The index is a cache; a file that is not a database is moved aside
+  with an ERROR line and a fresh one opened, at the cost of one re-hash.
+- **A backwards wall-clock step would have keyed the newest capture as the
+  oldest**, and the rolling window discards the oldest first (shown over the
+  pure functions, not on a real clock change). Keys are kept monotonic per
+  path.
 
 ### Proof items closed by the same review
 

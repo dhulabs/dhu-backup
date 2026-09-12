@@ -2146,3 +2146,38 @@ class HumanBytesTests(unittest.TestCase):
         self.assertEqual(dhu_backup_core.human_bytes(1100), "1.1 KiB")
         self.assertEqual(dhu_backup_core.human_bytes(5 * 1024 ** 3), "5.0 GiB")
         self.assertEqual(dhu_backup_core.human_bytes(12), "12 bytes")
+
+
+# ── owner_can_traverse (claim 2, independent review 2026-09-11) ──────────────
+
+
+class OwnerCanTraverseTests(unittest.TestCase):
+    """A root daemon must not mirror what the OWNER could not reach by itself."""
+
+    class _DirStat(object):
+        def __init__(self, uid, gid, mode):
+            self.st_mode = stat.S_IFDIR | mode
+            self.st_uid = uid
+            self.st_gid = gid
+
+    def st(self, uid, gid, mode):
+        return self._DirStat(uid, gid, mode)
+
+    def test_an_owner_owned_directory_is_always_traversable(self):
+        # The owner can chmod it, so nothing the daemon mirrors from it is new.
+        for mode in (0o000, 0o700, 0o755):
+            self.assertTrue(dhu_backup_core.owner_can_traverse(self.st(501, 20, mode), 501))
+
+    def test_a_root_owned_0700_directory_is_not(self):
+        """The live demonstration: an owner-owned file under root's 0700 directory
+        was mirrored world-readable although `cat` on the original was refused."""
+        self.assertFalse(dhu_backup_core.owner_can_traverse(self.st(0, 0, 0o700), 501))
+        self.assertFalse(dhu_backup_core.owner_can_traverse(self.st(0, 0, 0o700), 501, frozenset([0, 20])))
+
+    def test_other_execute_admits_and_group_execute_needs_membership(self):
+        self.assertTrue(dhu_backup_core.owner_can_traverse(self.st(0, 0, 0o755), 501))
+        self.assertTrue(dhu_backup_core.owner_can_traverse(self.st(0, 0, 0o711), 501))
+        self.assertFalse(dhu_backup_core.owner_can_traverse(self.st(0, 80, 0o750), 501))
+        self.assertFalse(dhu_backup_core.owner_can_traverse(self.st(0, 80, 0o750), 501, frozenset([20])))
+        self.assertTrue(dhu_backup_core.owner_can_traverse(self.st(0, 80, 0o750), 501, frozenset([20, 80])))
+        self.assertFalse(dhu_backup_core.owner_can_traverse(self.st(0, 80, 0o740), 501, frozenset([80])))

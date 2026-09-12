@@ -55,6 +55,16 @@ is newly *easy*. Every restore is logged with old and new hashes, and
 credential-class files are not in the readable store at all, so the worst case
 is a code revert rather than a secret revival.
 
+## 4a. The store is readable by every account that can read `store/`
+
+`store/` is world-readable so that recovery needs no privilege. The daemon only
+mirrors files the owner could reach — every directory on the way must be one
+the owner could enter, and a root-owned `0700` directory is not — so the owner
+learns nothing from the store it could not already read. Any *other* local
+account can read the store too, including a file the owner keeps at mode
+`0600` or `0000`. On a machine with more than one human account that is a
+disclosure the owner may not expect; a per-owner store mode is not built.
+
 ## 5. A hard link un-protects a file
 
 `st_nlink == 1` is a property of the **inode**, not of a name. So `ln notes.md

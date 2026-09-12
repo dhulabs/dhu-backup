@@ -661,6 +661,30 @@ def classify_entry(name, st, relpath, limits=DEFAULT_LIMITS, owner_uid=None):
 # ── Budgets (review C10/C11) ──────────────────────────────────────────────────
 
 
+def owner_can_traverse(st, owner_uid, owner_gids=()):
+    """Could a process running as the OWNER enter this directory by itself?
+
+    Claim 2 — "the agent-readable half carries nothing the agent could not
+    already read" — rests on the owner being able to reach every file the
+    daemon mirrors. The admission check is on the FILE's uid, and a root daemon
+    walks through any directory; so a file the owner owns, sitting under a
+    root-owned 0700 directory, was mirrored to the world-readable store even
+    though the owner could not read the original (independent review,
+    2026-09-11, demonstrated live: `cat` refused, the store copy readable).
+
+    A directory the owner OWNS is always traversable: the owner can chmod it.
+    Otherwise the owner needs group execute through one of its groups, or
+    other execute. Group membership is a fact the daemon resolves once at
+    start; an unknown owner has no groups and gets only the other bits, which
+    is the direction that mirrors LESS, never more.
+    """
+    if st.st_uid == owner_uid:
+        return True
+    if st.st_gid in owner_gids and st.st_mode & stat_mod.S_IXGRP:
+        return True
+    return bool(st.st_mode & stat_mod.S_IXOTH)
+
+
 def budget_decision(store_bytes, free_bytes, incoming_bytes, limits=DEFAULT_LIMITS):
     """Allow() or Degraded(reason) — the STORE-WIDE gate.
 

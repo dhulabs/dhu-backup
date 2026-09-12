@@ -24,6 +24,7 @@ import errno
 import hashlib
 import json
 import os
+import pwd
 import select
 import signal
 import sqlite3
@@ -92,6 +93,7 @@ class Config(object):
         # by `load_vault_extra`. Empty here rather than unset: a scan that runs
         # without the startup path (a test, a future caller) must get "no extra
         # rules", never an AttributeError halfway through a copy decision.
+        self.owner_gids = frozenset()
         self.extra_vault_globs = ()
         self.extra_vault_refusals = ()
         # The operator's optional directory exclusions, loaded once at startup
@@ -275,8 +277,35 @@ class Logger(object):
 # ── index ─────────────────────────────────────────────────────────────────────
 
 
-def open_index(config):
+def open_index(config, logger=None):
+    """The change-detection index. It is a CACHE: a corrupted one is set aside.
+
+    The first version raised `sqlite3.DatabaseError` out of `main` on a file
+    that was not a database, which under `Restart=always` is a restart every
+    two seconds with a frozen `ok` heartbeat and no ERROR line (independent
+    review, 2026-09-11). Setting the file aside costs one full re-hash of the
+    watched trees on the next scan and writes no duplicate versions, because
+    the newest version of every path is compared by content before a write.
+    """
+    try:
+        connection = _open_index_strict(config)
+    except sqlite3.DatabaseError as exc:
+        aside = "%s.corrupt-%d" % (config.index_path, int(time.time()))
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                os.replace(config.index_path + suffix, aside + suffix)
+            except OSError:
+                pass
+        if logger is not None:
+            logger.error("index %s is not a usable database (%s) — moved to %s; the next "
+                         "scan re-hashes every file once" % (config.index_path, exc, aside))
+        connection = _open_index_strict(config)
+    return connection
+
+
+def _open_index_strict(config):
     connection = sqlite3.connect(config.index_path)
+    connection.execute("PRAGMA quick_check").fetchall()
     connection.execute(
         "CREATE TABLE IF NOT EXISTS files ("
         " root_id TEXT NOT NULL, watch_root TEXT NOT NULL, relpath TEXT NOT NULL,"
@@ -368,7 +397,21 @@ def existing_versions(path_dir, leaf):
     return held
 
 
-def write_version(config, tree, root_id, slug, relpath, payload, digest, logger):
+def sweep_tmp_dir(config, logger):
+    """Remove staging files an interrupted write left behind, and say how many."""
+    removed = 0
+    for name in _listdir(config.tmp_dir):
+        try:
+            os.unlink(os.path.join(config.tmp_dir, name))
+            removed += 1
+        except OSError as exc:
+            logger.warn("var/tmp: could not remove %s: %s" % (name, _errname(exc)))
+    if removed:
+        logger.warn("var/tmp: removed %d staging file(s) left by an interrupted write" % removed)
+    return removed
+
+
+def write_version(config, tree, root_id, slug, relpath, payload, digest, logger, floor_ns=0):
     """Link one new version into `tree`. Returns the version key, or None.
 
     Layout: `<tree>/<root-id>/<slug>/<relpath-dir>/@<capture>-<hash>/<BASENAME>`.
@@ -382,27 +425,42 @@ def write_version(config, tree, root_id, slug, relpath, payload, digest, logger)
     """
     dir_mode, file_mode = config.tree_modes(tree)
     # C12: the daemon's own capture clock. Source mtime is never an input here;
-    # `version_key`'s signature is the proof.
-    key = dhu_backup_core.version_key(time.time_ns(), digest)
+    # `version_key`'s signature is the proof. `floor_ns` is one past the newest
+    # key this path already holds: a wall clock stepped backwards would
+    # otherwise key the newest capture as the OLDEST, and the rolling window
+    # would discard it first (independent review, 2026-09-11).
+    now_ns = time.time_ns()
+    if now_ns < floor_ns:
+        log_refusal_once(logger, "clock|backwards",
+                         "the clock is behind the newest stored version; keys are kept "
+                         "monotonic per path (further occurrences are not logged)")
+        now_ns = floor_ns
+    key = dhu_backup_core.version_key(now_ns, digest)
     subpath = dhu_backup_core.version_subpath(root_id, slug, relpath, key)
     target = os.path.join(config.tree_dir(tree), subpath)
-    ensure_dir(os.path.dirname(target), dir_mode, logger)
 
     temp_path = os.path.join(config.tmp_dir, "%d-%s" % (os.getpid(), digest[:16]))
-    handle = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
     try:
-        os.write(handle, payload)
-        os.fsync(handle)
-    finally:
-        os.close(handle)
-    # Mode set on the temp file, before it is linked into place: a window in
-    # which a store file exists at 0600 is a window in which recovery is broken.
-    # No copystat, no xattrs, no ACLs (M3) — a plain regular file.
-    os.chmod(temp_path, file_mode)
-    try:
+        handle = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(handle, payload)
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+        # Mode set on the temp file, before it is linked into place: a window in
+        # which a store file exists at 0600 is a window in which recovery is broken.
+        # No copystat, no xattrs, no ACLs (M3) — a plain regular file.
+        os.chmod(temp_path, file_mode)
+        # The version directory is created only once the bytes are safely on
+        # disk, so a write that fails for want of space leaves no empty version
+        # directory behind, and the staging file is removed on every failure.
+        ensure_dir(os.path.dirname(target), dir_mode, logger)
         os.link(temp_path, target)
     except OSError as exc:
-        os.unlink(temp_path)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
         if exc.errno == errno.EEXIST:
             logger.info("duplicate-version %s/%s" % (root_id, relpath))
             return None
@@ -438,7 +496,7 @@ def write_json_atomic(config, path, payload, mode):
 # ── watch roots (C7 / H7) ─────────────────────────────────────────────────────
 
 
-def resolve_watch_root(path, allowed_uids):
+def resolve_watch_root(path, allowed_uids, owner_uid=None, owner_gids=()):
     """(resolved_path, Allow()) or (None, Refuse(reason)) for one watch root.
 
     Walks the RAW configured path component by component, resolving a symlink
@@ -470,6 +528,9 @@ def resolve_watch_root(path, allowed_uids):
         except OSError as exc:
             return None, Refuse("component-%d-unstattable:%s" % (index, _errname(exc)))
         stats.append(st)
+        if (owner_uid is not None and stat_mod.S_ISDIR(st.st_mode)
+                and not dhu_backup_core.owner_can_traverse(st, owner_uid, owner_gids)):
+            return None, Refuse("component-%d-not-traversable-by-owner" % index)
         if stat_mod.S_ISLNK(st.st_mode):
             # Refuse HERE with the accurate reason. Truncating the stat list and
             # letting the pure verdict speak made an intermediate agent-owned
@@ -520,7 +581,8 @@ def expand_roots(config, logger):
             # The PARENT is canonicalised from the root-owned config, then its
             # components are lstat-checked; children are enumerated without
             # following symlinks, so a symlinked worktree is skipped, not chased.
-            parent_real, verdict = resolve_watch_root(parent, allowed_uids)
+            parent_real, verdict = resolve_watch_root(parent, allowed_uids,
+                                                      config.owner_uid, config.owner_gids)
             if isinstance(verdict, Refuse):
                 logger.warn("watch-root parent refused (%s): %s" % (verdict.reason, parent))
                 refusals.append((pattern, verdict.reason))
@@ -553,13 +615,26 @@ def expand_roots(config, logger):
                 logger.warn("watch-root cap reached, refusing: %s" % candidate)
                 refusals.append((candidate, "max-watch-roots"))
                 break
-            resolved, verdict = resolve_watch_root(candidate, allowed_uids)
+            resolved, verdict = resolve_watch_root(candidate, allowed_uids,
+                                                   config.owner_uid, config.owner_gids)
             if isinstance(verdict, Refuse):
                 logger.warn("watch-root refused (%s): %s" % (verdict.reason, candidate))
                 refusals.append((candidate, verdict.reason))
                 continue
             roots.append((root_id, resolved))
     return roots, refusals
+
+
+def owner_group_ids(owner_uid):
+    """Every gid the owner holds, for the traversal rule. Unknown owner: none."""
+    try:
+        entry = pwd.getpwuid(owner_uid)
+    except KeyError:
+        return frozenset()
+    try:
+        return frozenset(os.getgrouplist(entry.pw_name, entry.pw_gid))
+    except OSError:
+        return frozenset([entry.pw_gid])
 
 
 def _safe_mtime(path):
@@ -598,7 +673,7 @@ MAX_WALK_DEPTH = 32
 
 
 def walk_root(root_fd, counters, logger, on_file, absolute_root=None, exclude_globs=(),
-              worktrees_covered=False):
+              worktrees_covered=False, owner_uid=None, owner_gids=()):
     """Depth-first walk over directory file descriptors. Does not close root_fd.
 
     No path string is ever re-resolved (C8): each directory is opened
@@ -621,11 +696,11 @@ def walk_root(root_fd, counters, logger, on_file, absolute_root=None, exclude_gl
     that protects MORE, which is the safe one for a subtractive rule.
     """
     _walk_dir(root_fd, "", counters, logger, on_file, 0, absolute_root, exclude_globs,
-              worktrees_covered)
+              worktrees_covered, owner_uid, owner_gids)
 
 
 def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=None,
-              exclude_globs=(), worktrees_covered=False):
+              exclude_globs=(), worktrees_covered=False, owner_uid=None, owner_gids=()):
     if absolute_dir is not None and len(counters.directories) < MAX_WATCHED_DIRS:
         # Path strings collected here feed the kqueue TRIGGER only. Capture
         # itself never re-resolves a path (C8); a trigger fd pointing somewhere
@@ -710,10 +785,23 @@ def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=N
             counters.refuse("dir-open-%s" % _errname(exc))
             logger.warn("dir open refused %s: %s" % (child_rel, _errname(exc)))
             continue
+        if owner_uid is not None:
+            # Claim 2: a directory the OWNER could not enter is not descended,
+            # whatever the daemon's own privilege. Decided on the fstat of the
+            # open fd, like every other admission decision (C8).
+            child_st = os.fstat(child_fd)
+            if not dhu_backup_core.owner_can_traverse(child_st, owner_uid, owner_gids):
+                counters.refuse("dir-not-traversable-by-owner")
+                log_refusal_once(logger, "trav|" + child_rel,
+                                 "not descending %s: the owner (uid %d) could not enter it "
+                                 "(uid %d, mode %04o)" % (child_rel, owner_uid, child_st.st_uid,
+                                                          child_st.st_mode & 0o7777))
+                os.close(child_fd)
+                continue
         try:
             _walk_dir(child_fd, child_rel, counters, logger, on_file, depth + 1,
                       os.path.join(absolute_dir, name) if absolute_dir else None,
-                      exclude_globs, worktrees_covered)
+                      exclude_globs, worktrees_covered, owner_uid, owner_gids)
         finally:
             os.close(child_fd)
 
@@ -1255,6 +1343,13 @@ def scan_once(config, connection, logger, state):
             counters.refuse("root-open-%s" % _errname(exc))
             logger.warn("watch root unopenable %s: %s" % (watch_root, _errname(exc)))
             continue
+        if not dhu_backup_core.owner_can_traverse(os.fstat(root_fd), config.owner_uid,
+                                                  config.owner_gids):
+            counters.refuse("root-not-traversable-by-owner")
+            logger.warn("watch root refused %s: the owner (uid %d) could not enter it"
+                        % (watch_root, config.owner_uid))
+            os.close(root_fd)
+            continue
 
         slug = dhu_backup_core.root_slug(root_id, watch_root)
         write_root_manifest(config, root_id, slug, watch_root, logger)
@@ -1394,7 +1489,8 @@ def scan_once(config, connection, logger, state):
 
                 try:
                     written = write_version(
-                        config, tree, _root_id, _slug, relpath, payload, digest, logger
+                        config, tree, _root_id, _slug, relpath, payload, digest, logger,
+                        floor_ns=(held[-1][1] + 1) if held else 0,
                     )
                 except OSError as exc:
                     # A store write that fails (ENOSPC, EROFS, EPERM, EDQUOT)
@@ -1425,7 +1521,8 @@ def scan_once(config, connection, logger, state):
         try:
             walk_root(root_fd, counters, logger, handle_file, watch_root,
                       exclude_globs=config.exclude_globs,
-                      worktrees_covered=worktrees_covered_by_another_root(watch_root, roots))
+                      worktrees_covered=worktrees_covered_by_another_root(watch_root, roots),
+                      owner_uid=config.owner_uid, owner_gids=config.owner_gids)
         finally:
             os.close(root_fd)
 
@@ -1574,15 +1671,17 @@ def remove_version_dirs(plan, logger):
                 target = os.path.join(version_dir, leaf)
                 st = os.lstat(target)
                 os.unlink(target)
-                # Credited only AFTER the unlink succeeds.
-                freed += st.st_size
                 if st.st_nlink > 1:
                     # M8: an agent can `ln` a 0444 store file into its own
                     # workspace — linking needs write permission only on the
-                    # destination — which pins the inode so this frees nothing.
+                    # destination — which pins the inode so this frees nothing,
+                    # and nothing is credited (independent review, 2026-09-11).
                     pinned += 1
                     logger.warn("removed a version with %d links — space not reclaimed"
                                 % st.st_nlink)
+                else:
+                    # Credited only AFTER the unlink succeeds.
+                    freed += st.st_size
             os.rmdir(version_dir)
             removed += 1
         except OSError as exc:
@@ -1883,7 +1982,11 @@ def main(argv=None):
     for line, reason in config.exclude_refusals:
         logger.error("exclude.conf REFUSED %r: %s" % (line, reason))
 
-    connection = open_index(config)
+    config.owner_gids = owner_group_ids(config.owner_uid)
+    logger.info("owner uid=%d groups=%s" % (config.owner_uid, ",".join(
+        str(g) for g in sorted(config.owner_gids)) or "none"))
+    sweep_tmp_dir(config, logger)
+    connection = open_index(config, logger)
     if meta_get(connection, "store_bytes") is None:
         measured = (measure_store_bytes(config.store_dir)
                     + measure_store_bytes(config.vault_dir))

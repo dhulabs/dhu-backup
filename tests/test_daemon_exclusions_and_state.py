@@ -854,3 +854,156 @@ class WorktreesCoverageTests(ScratchCase):
         self.assertFalse(covered("/home/you/proj/.claude/worktrees/agent-a", roots))
         self.assertFalse(covered("/home/you/proj", [("repo", "/home/you/proj")]))
         self.assertFalse(covered("/home/you/proj", [("other", "/home/you/proj2/.claude/worktrees/x")]))
+
+
+# ── F: claim 2 in the walk, and the write path's failure hygiene ─────────────
+
+
+class WalkOwnerTraversalTests(ScratchCase):
+    """A directory the OWNER could not enter is not descended, whoever runs the daemon."""
+
+    def walk(self, owner_uid, owner_gids=()):
+        seen = []
+        counters = DAEMON.Counters()
+        logger = _RecordingLogger()
+        root_fd = os.open(self.scratch, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            DAEMON.walk_root(root_fd, counters, logger,
+                             lambda _fd, _name, relpath: seen.append(relpath), self.scratch,
+                             owner_uid=owner_uid, owner_gids=owner_gids)
+        finally:
+            os.close(root_fd)
+        DAEMON._LOGGED_REFUSALS.clear()
+        return sorted(seen), counters, logger
+
+    def setUp(self):
+        super(WalkOwnerTraversalTests, self).setUp()
+        self.write("open/a.txt")
+        self.write("closed/b.txt")
+        self.write("grouped/c.txt")
+        os.chmod(os.path.join(self.scratch, "open"), 0o755)
+        os.chmod(os.path.join(self.scratch, "closed"), 0o700)
+        os.chmod(os.path.join(self.scratch, "grouped"), 0o750)
+        self.stranger = os.getuid() + 12345   # not the test user: cannot chmod these
+        self.gid = os.stat(os.path.join(self.scratch, "grouped")).st_gid
+
+    def test_a_stranger_owner_sees_only_what_other_execute_admits(self):
+        seen, counters, logger = self.walk(self.stranger)
+        self.assertEqual(seen, ["open/a.txt"])
+        self.assertEqual(counters.refusals.get("dir-not-traversable-by-owner"), 2)
+        self.assertTrue(any("could not enter" in m for m in logger.infos))
+
+    def test_group_membership_opens_a_group_executable_directory(self):
+        seen, counters, _ = self.walk(self.stranger, frozenset([self.gid]))
+        self.assertEqual(seen, ["grouped/c.txt", "open/a.txt"])
+        self.assertEqual(counters.refusals.get("dir-not-traversable-by-owner"), 1)
+
+    def test_the_real_owner_sees_everything_it_owns(self):
+        seen, counters, _ = self.walk(os.getuid())
+        self.assertEqual(seen, ["closed/b.txt", "grouped/c.txt", "open/a.txt"])
+        self.assertNotIn("dir-not-traversable-by-owner", counters.refusals)
+
+    def test_without_an_owner_the_walk_is_unchanged(self):
+        seen, counters, _ = self.walk(None)
+        self.assertEqual(len(seen), 3)
+
+
+class WriteVersionHygieneTests(ScratchCase):
+    """A failed write leaves neither a staging file nor an empty version directory."""
+
+    def setUp(self):
+        super(WriteVersionHygieneTests, self).setUp()
+        self.config = DAEMON.Config({"root": self.scratch}, "test.conf")
+        for d in (self.config.var_dir, self.config.store_dir, self.config.tmp_dir):
+            os.makedirs(d, 0o755, exist_ok=True)
+        self.logger = _RecordingLogger()
+
+    def write(self, payload=b"hello\n", floor_ns=0):
+        digest = __import__("hashlib").sha256(payload).hexdigest()
+        return DAEMON.write_version(self.config, "store", "proj", "proj-abcd1234", "docs/a.md",
+                                    payload, digest, self.logger, floor_ns=floor_ns), digest
+
+    def version_dirs(self):
+        base = os.path.join(self.config.store_dir, "proj", "proj-abcd1234", "docs")
+        return sorted(n for n in os.listdir(base)) if os.path.isdir(base) else []
+
+    def test_a_good_write_leaves_one_version_and_no_staging_file(self):
+        key, digest = self.write()
+        self.assertEqual(self.version_dirs(), [key])
+        self.assertEqual(os.listdir(self.config.tmp_dir), [])
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.config.store_dir, "proj", "proj-abcd1234", "docs", key, "a.md")))
+
+    def test_a_write_that_fails_for_want_of_space_leaves_nothing_behind(self):
+        real_write = os.write
+
+        def enospc(handle, data):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        os.write = enospc
+        try:
+            with self.assertRaises(OSError):
+                self.write()
+        finally:
+            os.write = real_write
+        self.assertEqual(self.version_dirs(), [], "no empty version directory")
+        self.assertEqual(os.listdir(self.config.tmp_dir), [], "no orphan staging file")
+
+    def test_a_link_that_fails_leaves_no_staging_file(self):
+        real_link = os.link
+
+        def edquot(src, dst):
+            raise OSError(errno.EDQUOT, "Disk quota exceeded")
+        os.link = edquot
+        try:
+            with self.assertRaises(OSError):
+                self.write()
+        finally:
+            os.link = real_link
+        self.assertEqual(os.listdir(self.config.tmp_dir), [])
+
+    def test_the_key_never_goes_below_the_floor_when_the_clock_steps_back(self):
+        far_future = 4_000_000_000_000_000_000  # well past any wall clock this decade
+        key, _ = self.write(b"one\n", floor_ns=far_future)
+        self.assertEqual(dhu_backup_core.parse_version_key(key)[0], far_future)
+        self.assertTrue(any("clock is behind" in m for m in self.logger.infos))
+        DAEMON._LOGGED_REFUSALS.clear()
+
+    def test_the_startup_sweep_removes_orphans_and_says_so(self):
+        for name in ("123-deadbeef", "json-1-2"):
+            with open(os.path.join(self.config.tmp_dir, name), "w") as handle:
+                handle.write("x")
+        self.assertEqual(DAEMON.sweep_tmp_dir(self.config, self.logger), 2)
+        self.assertEqual(os.listdir(self.config.tmp_dir), [])
+        self.assertTrue(any("2 staging file(s)" in m for m in self.logger.warnings))
+        self.assertEqual(DAEMON.sweep_tmp_dir(self.config, self.logger), 0)
+
+
+class CorruptIndexTests(ScratchCase):
+    """A corrupted index is set aside with an ERROR line, never a crash loop."""
+
+    def setUp(self):
+        super(CorruptIndexTests, self).setUp()
+        self.config = DAEMON.Config({"root": self.scratch}, "test.conf")
+        os.makedirs(self.config.var_dir, 0o755)
+        self.logger = _RecordingLogger()
+
+    def test_garbage_is_moved_aside_and_a_fresh_index_opened(self):
+        with open(self.config.index_path, "wb") as handle:
+            handle.write(b"this is not a database" * 100)
+        connection = DAEMON.open_index(self.config, self.logger)
+        self.addCleanup(connection.close)
+        connection.execute("SELECT COUNT(*) FROM files").fetchone()
+        aside = [n for n in os.listdir(self.config.var_dir) if ".corrupt-" in n]
+        self.assertEqual(len(aside), 1, os.listdir(self.config.var_dir))
+        self.assertTrue(any("not a usable database" in m for m in self.logger.errors))
+
+    def test_a_good_index_is_opened_in_place_with_no_error(self):
+        first = DAEMON.open_index(self.config, self.logger)
+        first.execute("INSERT INTO meta VALUES ('k', 'v')")
+        first.commit()
+        first.close()
+        second = DAEMON.open_index(self.config, self.logger)
+        self.addCleanup(second.close)
+        self.assertEqual(second.execute("SELECT value FROM meta WHERE key='k'").fetchone()[0], "v")
+        self.assertEqual(self.logger.errors, [])
+
