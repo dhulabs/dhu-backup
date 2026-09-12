@@ -2067,6 +2067,14 @@ def main(argv=None):
                 logger.warn("trigger: watching %d of %d directories (%d failure(s) so far)"
                             % (trigger.directories_watched, len(counters.directories),
                                trigger.watch_failures))
+        # The prune runs BEFORE the heartbeat is written, so `prune_last_removed`,
+        # `prune_last_failed` and `index_reconciled` describe this cycle. Written
+        # first, they described the previous one, and a `--once` run that had
+        # just pruned published nulls (found by a diagnose-defect run, 2026-09-12).
+        if not state.get("degraded_reason") and time.time() - last_prune >= config.prune_interval_seconds:
+            _prune_and_record(config, connection, logger, state)
+            last_prune = time.time()
+
         try:
             write_state(config, state, counters, store_bytes, free_bytes, roots, refused,
                         scan_error=scan_error, trigger=trigger,
@@ -2076,10 +2084,6 @@ def main(argv=None):
             # fails, say so on the one channel that is left.
             logger.error("HEARTBEAT PUBLISH FAILED: %s: %s — the state file is now STALE"
                          % (type(exc).__name__, exc))
-
-        if not state.get("degraded_reason") and time.time() - last_prune >= config.prune_interval_seconds:
-            _prune_and_record(config, connection, logger, state)
-            last_prune = time.time()
 
         if args.once or _STOP["flag"]:
             break
