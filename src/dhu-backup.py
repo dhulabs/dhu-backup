@@ -447,6 +447,7 @@ def _status_undetermined(install_root, detail, platform_string):
         "exit_code": dhu_backup_core.status_exit_code("unreadable-heartbeat"),
         "last_capture": None, "watch_roots": None, "store": None,
         "free_space": None, "warning": None, "exclusions": None, "vault_extra": None,
+        "files_deferred_by_throttle": None,
         "next_step": {"sentence": step.sentence, "command": step.command},
     }
 
@@ -469,9 +470,27 @@ def _status_payload(install_root, now_epoch, budget, platform_string):
         "warning": _warning_status(state, health),
         "exclusions": _glob_status(state, "exclude_globs", "exclude_refused"),
         "vault_extra": _glob_status(state, "vault_extra_globs", "vault_extra_refused"),
+        "files_deferred_by_throttle": _deferred_by_throttle(state),
         "next_step": {"sentence": step.sentence, "command": step.command},
     }
     return payload
+
+
+def _deferred_by_throttle(state):
+    """The daemon's count of admitted files whose copy was DEFERRED by the
+    per-scan throttle, or None when the heartbeat does not carry one.
+
+    None is "not reported" (an older daemon), never 0: a cold start on a real
+    repo defers thousands of files, and a status that printed 0 for a daemon
+    that simply did not say would be the silent fallback this file avoids.
+    The count includes files that already have an older version stored, so
+    it means "not up to date", not "not protected" — the daemon names it that
+    way and this line repeats the distinction.
+    """
+    value = state.get("files_deferred_by_throttle")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _last_capture(state, now_epoch):
@@ -627,6 +646,13 @@ def format_status(payload):
     if warning:
         lines.append("  warning      %s" % ", ".join(warning["reasons"]))
         lines.append("               %s" % warning["detail"])
+
+    deferred = payload.get("files_deferred_by_throttle")
+    if deferred:
+        # Only when non-zero: a backlog is a fact worth a line, and "0
+        # deferred" on every healthy status is a line nobody reads.
+        lines.append("  backlog      {:,} admitted file(s) deferred by the per-scan throttle; "
+                     "they are copied on the next scans".format(deferred))
 
     for label, key in (("exclusions  ", "exclusions"), ("vault extras", "vault_extra")):
         globs = payload.get(key)

@@ -1917,6 +1917,52 @@ class CliRestoreDestinationTests(FixtureCase):
         self.assertIn("ERROR --asof must be", done.stdout)
 
 
+class StatusBacklogTests(FixtureCase):
+    """`files_deferred_by_throttle` from the heartbeat, on both status surfaces."""
+
+    def setUp(self):
+        super(StatusBacklogTests, self).setUp()
+        self.helper = load_helper_module()
+
+    def status(self, *argv):
+        env = dict(os.environ, TZ="UTC")
+        return subprocess.run(
+            [PYTHON, "-E", "-s", "-S", HELPER, "--install-root", self.install_root, "status"]
+            + list(argv), capture_output=True, text=True, env=env)
+
+    def test_a_non_zero_backlog_is_a_text_line_and_a_json_field(self):
+        write_state(self.install_root, dict(fresh_ok_state(), files_deferred_by_throttle=4300))
+        text = self.status().stdout
+        self.assertIn("  backlog      4,300 admitted file(s) deferred by the per-scan throttle; "
+                      "they are copied on the next scans", text)
+        payload = json.loads(self.status("--json").stdout)
+        self.assertEqual(payload["files_deferred_by_throttle"], 4300)
+        self.assertEqual(payload["health"]["verdict"], "ok")
+
+    def test_a_zero_backlog_is_no_line_and_the_field_is_zero(self):
+        write_state(self.install_root, dict(fresh_ok_state(), files_deferred_by_throttle=0))
+        self.assertNotIn("backlog", self.status().stdout)
+        self.assertEqual(json.loads(self.status("--json").stdout)["files_deferred_by_throttle"], 0)
+
+    def test_a_heartbeat_without_the_count_reports_null_never_zero(self):
+        state = fresh_ok_state()
+        self.assertNotIn("files_deferred_by_throttle", state)
+        payload = json.loads(self.status("--json").stdout)
+        self.assertIn("files_deferred_by_throttle", payload)
+        self.assertIsNone(payload["files_deferred_by_throttle"])
+        self.assertNotIn("backlog", self.status().stdout)
+
+    def test_a_wrongly_typed_count_is_null_and_the_key_survives_an_undetermined_status(self):
+        for bad in ("4300", True, -1, 1.5, [4300]):
+            write_state(self.install_root, dict(fresh_ok_state(), files_deferred_by_throttle=bad))
+            payload = self.helper.status_payload(self.install_root, platform_string="darwin")
+            self.assertIsNone(payload["files_deferred_by_throttle"], repr(bad))
+        payload = self.helper.status_payload("", platform_string="darwin")
+        self.assertEqual(payload["health"]["verdict"], "unreadable-heartbeat")
+        self.assertIn("files_deferred_by_throttle", payload)
+        self.assertIsNone(payload["files_deferred_by_throttle"])
+
+
 class BannerVerdictTests(FixtureCase):
     """C1-F6: every command prints the SAME verdict for the same heartbeat.
 

@@ -350,7 +350,7 @@ the full page.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-712 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
+716 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
 runs the same suite on `macos-latest` and `ubuntu-latest`, which is the standing
 proof that it passes on a clean machine with nothing from a developer's own.
 

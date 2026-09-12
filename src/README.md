@@ -799,6 +799,7 @@ happened — a missing field never stands in for a failure:
   "warning": null,
   "exclusions": {"globs": 1, "refused": 0},
   "vault_extra": null,
+  "files_deferred_by_throttle": 0,
   "next_step": {"sentence": null, "command": null}
 }
 ```
@@ -811,7 +812,10 @@ daemon did not measure it this cycle, never `0`: a failed `statvfs` that became
 heartbeat reporting 30 GB free. `exclusions` and `vault_extra` are null when the
 operator has added no rules of that kind. `warning` carries `reasons` (a list,
 because both triggers can fire at once) and `detail` only under the `warning`
-verdict.
+verdict. `files_deferred_by_throttle` is the daemon's own count of admitted
+files whose copy the per-scan throttle pushed to a later scan — "not up to
+date", not "not protected" — and null when the heartbeat does not carry it;
+the text output prints a `backlog` line only when it is non-zero.
 
 The same payload is the MCP tool `dhu_backup_status`, annotated read-only, with
 the rendered text beside it in a `text` field. A stopped daemon comes back as an
@@ -1114,7 +1118,7 @@ record. The daemon's own capture log is the authoritative one.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-712 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
+716 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
 platform-aware rather than platform-specific: it asserts THIS platform's install
 surface, and asserts the other platform's through `--dry-run --platform`, which
 is what that flag exists for. Three tests that assert the scripts refuse without
