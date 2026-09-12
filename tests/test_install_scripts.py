@@ -651,7 +651,7 @@ class DocumentedTestCountTest(unittest.TestCase):
     failing test that says which file to edit.
     """
 
-    DOCS = ("README.md", "CONTRIBUTING.md", "docs/PROOFS.md")
+    DOCS = ("README.md", "CONTRIBUTING.md", "docs/PROOFS.md", "src/README.md")
 
     def test_the_docs_state_the_number_of_tests_that_actually_run(self):
         loader = unittest.TestLoader()
@@ -1633,9 +1633,9 @@ class WatchSuggestionFormatTest(unittest.TestCase):
     def test_a_trailing_glob_takes_its_id_from_the_last_real_component(self):
         """`/home/a/worktrees/*` has the basename `*`, which sanitises to
         nothing — every glob root would otherwise be called `repo`."""
-        out = self.suggest("/home/a/.claude/worktrees/*", "/home/a/hapos-task-*")
+        out = self.suggest("/home/a/.claude/worktrees/*", "/home/a/agent-task-*")
         self.assertIn("--watch 'worktrees=/home/a/.claude/worktrees/*'", out)
-        self.assertIn("--watch 'hapos-task=/home/a/hapos-task-*'", out)
+        self.assertIn("--watch 'agent-task=/home/a/agent-task-*'", out)
 
     def test_duplicate_ids_are_suffixed_rather_than_dropped(self):
         """render_watchlist refuses a duplicate id outright, and both

@@ -46,6 +46,7 @@ gets an honest answer and the owner recovers it with sudo.
 import argparse
 import json
 import os
+import stat
 import sys
 import time
 
@@ -129,9 +130,17 @@ def load_entries(install_root):
                         epoch_ns, sha = dhu_backup_core.parse_version_key(name)
                         full = os.path.join(version_dir, leaf)
                         try:
-                            size = os.lstat(full).st_size
+                            leaf_stat = os.lstat(full)
                         except OSError:
                             continue
+                        if not stat.S_ISREG(leaf_stat.st_mode):
+                            # Only the daemon writes here, and it writes plain
+                            # files. A directory under a version-shaped name is
+                            # an agent-named tree that reached the store before
+                            # the walk refused that shape; presenting it as a
+                            # version made `cat` open a directory and crash.
+                            continue
+                        size = leaf_stat.st_size
                         entry = entries.setdefault(
                             (tree, root_id, slug, relpath),
                             {"root_id": root_id, "slug": slug, "relpath": relpath,

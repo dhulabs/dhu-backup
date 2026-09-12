@@ -33,7 +33,7 @@ accelerating it, and the residual window is named rather than argued away.
 
 The direct consequence of the above. The window is 15 seconds and the gap is
 real and unbounded for short-lived files. The work the founding incident lost
-had lived about an hour, which is three orders of magnitude inside protection —
+had lived about an hour, more than two orders of magnitude inside protection —
 but a file written and removed by a build step within one sweep is never
 captured, and nothing in the heartbeat will tell you it existed.
 
@@ -69,9 +69,11 @@ world-readable store would have published a file the user cannot read.
 Versions already stored survive, the refusal is logged and counted in the
 heartbeat, and protection resumes on the next scan after the link goes.
 
-A second, smaller hard-link effect runs the other way: an agent can `ln` a 0444
-store file into its own workspace, because linking needs write permission only
-on the destination. Pruning then unlinks the store's name and frees nothing,
+A second, smaller hard-link effect runs the other way, on macOS: an agent can
+`ln` a 0444 store file into its own workspace, because linking there needs write
+permission only on the destination. Stock Linux sets `fs.protected_hardlinks=1`,
+which refuses a link to a file the linker cannot write, so it does not arise
+there. Pruning then unlinks the store's name and frees nothing,
 because the agent's link keeps the inode alive. That is disk consumption, not
 corruption. The free-space floor is the control that bounds it, and the prune
 pass reports every version it unlinked whose link count was above one.
@@ -113,6 +115,16 @@ versions of one file out of the store by rewriting it 200 times. And a
 store-wide budget hit stops capture entirely until a human intervenes: DEGRADED
 never self-heals, deliberately, because "prune to make room" converts a
 guarantee into a best-effort cache whose only symptom is a missing file.
+
+**If you installed v0.1.0 or v0.2.0, reinstall.** In those two releases both
+retention rules were keyed on the directory a file sits in rather than on the
+file, so a directory holding more than 200 files kept versions for only 200 of
+them, and after 30 days the age prune would have kept one version per
+directory. The daemon from v0.3.0 keys both on the file and, at start, forgets
+every indexed path the store no longer holds, so those files are captured again
+on the next scan. Versions the old window already removed are gone; the files
+themselves were never touched. Details and the measurements are in
+[PROOFS §6](PROOFS.md#6-the-independent-review-of-2026-09-11).
 
 The daemon now says so on the way down rather than only at the bottom. Inside
 1.5x the free-space floor, or above 80% of the store ceiling, `state` is

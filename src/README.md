@@ -194,8 +194,8 @@ which is worth having in a process that reads agent-written trees.
 ### The interpreter
 
 `/usr/bin/python3` from the distro package (`apt-get install python3`),
-root-owned. On Ubuntu 24.04 it is a root-owned symlink to a root-owned
-`python3.12`, and both halves are checked: `install.sh` refuses to write the unit
+root-owned. On Ubuntu it is a root-owned symlink to a root-owned
+`python3.NN` (3.12 on 24.04, 3.14 on 26.04), and both halves are checked: `install.sh` refuses to write the unit
 unless the link AND its resolved target are root-owned, and the daemon re-runs
 the same check on its own interpreter at every start, reporting
 `interpreter_root_owned` in the heartbeat. Never pyenv, conda, homebrew or node —
@@ -276,13 +276,13 @@ the Linux root, the inotify trigger and both latencies, the hard-link refusal,
 unprivileged user every write to the mirror and `kill` on the daemon, the whole
 recovery CLI with no sudo, `uninstall.sh` for real — removing `bin/`, `etc/` and
 the unit file while KEEPING every captured version — and the whole suite green
-under Python 3.12. Forty-four checks, all passing.
+under Python 3.12, every check passing.
 
-**What a container CANNOT prove, and what is therefore still pending on a real
-host:** there is no systemd manager in one, so the unit actually loading
-(`systemctl enable --now`), polkit's refusal of a non-root `systemctl stop`,
-`ProtectSystem` / `ProtectHome` / `PrivateTmp` taking effect, and survival across
-a reboot are all unexercised. Those need an Ubuntu 24.04 host or VM.
+**What a container cannot prove** — there is no systemd manager in one — was
+taken to a real systemd host afterwards: the unit actually loading, polkit's
+refusal of a non-root `systemctl stop`, and `ProtectSystem` / `ProtectHome` /
+`PrivateTmp` taking effect are all recorded in `docs/PROOFS.md` §4, on Ubuntu
+26.04 with Python 3.14. Survival across a reboot is the one item still open.
 
 `--no-service` exists for exactly that gap: it installs the files and registers
 nothing, so the daemon can be started by hand in a container. Its gate is a fact
@@ -299,20 +299,16 @@ forever. On Linux the same line is a systemd system unit; see **Linux** above.
 It walks the roots named in `etc/watchlist.conf` and copies changed files into
 `store/` or `vault/`.
 
-**Capture timing, measured on this machine rather than claimed.** A watch on
-every watched DIRECTORY wakes the daemon — `kqueue` `EVFILT_VNODE` on macOS,
-inotify on Linux — and a 15 s floor sweep runs underneath it as the guarantee:
-
-| change | captured after |
-|---|---|
-| a file created, deleted or renamed | **0.7 s** (the kqueue trigger fires) |
-| a file rewritten IN PLACE (`echo x > f`) | **the floor sweep**, measured 20.6 s against a 30 s floor |
+**Capture timing, measured rather than claimed** — the dated table below. A
+watch on every watched DIRECTORY wakes the daemon — `kqueue` `EVFILT_VNODE` on
+macOS, inotify on Linux — and a 15 s floor sweep runs underneath it as the
+guarantee.
 
 A directory watch does not fire for an in-place rewrite — that is a measurement,
 not an assumption. Editors that write-then-rename are caught immediately; a
 shell redirect waits for the sweep. Watching every FILE would close the gap at
-~6,000 more file descriptors and much more state in the one process that must
-never die; not taken.
+the cost of a file descriptor per watched file and much more state in the one
+process that must never die; not taken.
 
 **Linux is faster on the second row and identical on the first**, because a
 directory inotify watch reports `IN_CLOSE_WRITE` for files written inside it and
@@ -430,6 +426,16 @@ exists because a glob root such as `worktrees` expands to many directories, and 
 worktrees both holding `lib/x.ts` would otherwise share one version history. The
 absolute path lives in `var/roots/`, outside the mirrored trees, so no captured
 filename can collide with a marker.
+
+**The version directories of every file in one source directory are siblings**
+under `<relpath-dir>`, and the leaf is the only thing that says which file a
+version belongs to. Every retention decision is keyed on `(relpath-dir, leaf)`
+for that reason; v0.1.0 and v0.2.0 keyed both the rolling window and the age
+prune on the directory alone, which is why a reinstall over either is
+recommended (see `docs/LIMITS.md` §7 and `docs/PROOFS.md` §6). The walk refuses
+a source entry whose name parses as a version key (`walk-version-key-shaped`)
+so nothing an agent names can enter that namespace, and a name that is not
+valid UTF-8 (`walk-name-not-utf8`), which the index and the log cannot hold.
 
 ## The five budgets
 
@@ -563,7 +569,7 @@ cat /Library/DHU/backup/var/state.json
   "files_scanned": 6253,
   "versions_written": 12,
   "bytes_written": 204800,
-  "files_pending_first_copy": 0,
+  "files_deferred_by_throttle": 0,
   "refusals_by_reason": { "walk-symlink": 2, "admission-excluded-extension": 43 },
   "store_bytes": 91234567,
   "free_bytes": 30064771072,
@@ -602,14 +608,22 @@ makes adding a state safe in the only direction that matters: an old helper
 reading a newer daemon says "heartbeat state is 'warning', which this version
 does not understand" and fails loudly.
 
-`files_pending_first_copy` is the throttle's backlog. On a cold start a working
+`index_reconciled` is how many indexed paths the daemon found no version of in
+the store at its last start or prune, and therefore forgot, so that the next
+scan captures them again. It is non-zero once after upgrading from v0.1.0 or
+v0.2.0 and zero from then on; a non-zero value on an ordinary day means
+something removed versions from the store, which only root can do.
+
+`files_deferred_by_throttle` is the throttle's backlog: how many admitted files the last scan deferred to the next one. On a cold start a working
 tree of a few thousand files leaves most of them without a copy for the first
 minute, and `files_scanned` alone reads as though they were all protected.
 
 No paths ever appear in the file, so it is safe to read anywhere. A tool that
 reads it at start-up can distinguish six faults from it: degraded, unprotected,
-scan-failed, stale (no scan for 5 minutes), absent (no heartbeat AND no
-installed daemon), and unreadable.
+scan-failed, stale (no scan for 5 minutes), no-heartbeat (no heartbeat file at
+all), and unreadable-heartbeat. Those, with `ok` and `warning`, are the helper's
+eight `HEALTH_VERDICTS`: the five states the daemon writes plus the three
+things the daemon cannot say about itself.
 
 ## Recovery — no sudo, no human, one command
 
@@ -1026,7 +1040,7 @@ record. The daemon's own capture log is the authoritative one.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-413 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
+635 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
 platform-aware rather than platform-specific: it asserts THIS platform's install
 surface, and asserts the other platform's through `--dry-run --platform`, which
 is what that flag exists for. Three tests that assert the scripts refuse without

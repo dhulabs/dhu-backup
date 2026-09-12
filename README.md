@@ -179,7 +179,7 @@ Every invocation prints the daemon's health first, so "no versions" is never
 mistaken for "capture stopped two days ago". In `--json` mode that verdict
 becomes a `health` field of the object, so it is carried rather than droppable.
 
-There are seven verdicts and `warning` is the one worth knowing about: it means
+There are eight verdicts and `warning` is the one worth knowing about: it means
 capture is running normally but a store-wide budget is close, so it will stop.
 Capture stopping is by design and never self-heals, and the point of the warning
 is that you hear about it while there is still time to free space or raise the
@@ -279,6 +279,15 @@ only REMOVE it, and it is acceptable only because it sits root-owned 0644 beside
 the `watchlist.conf` that already decides what is protected at all. Every glob
 in force and every directory it skips are counted in the heartbeat.
 
+One built-in rule is about position rather than a name. A `.claude/worktrees`
+directory inside a watched repository is walked as part of that repository,
+**unless** one of your watch roots covers it — `--watch 'wt=/path/to/repo/.claude/worktrees/*'`
+— in which case it is skipped under the repository root and every worktree is
+captured under its own root instead, once rather than twice. The first two
+releases skipped it unconditionally, which left an agent's worktree protected
+by nothing unless the operator had also named it; that is the founding
+incident's exact shape, and it was found by the independent review.
+
 ## What it deliberately is not
 
 Three ways of making recovery more convenient would each rebuild a privileged
@@ -335,7 +344,7 @@ the full page.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-618 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
+635 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
 runs the same suite on `macos-latest` and `ubuntu-latest`, which is the standing
 proof that it passes on a clean machine with nothing from a developer's own.
 

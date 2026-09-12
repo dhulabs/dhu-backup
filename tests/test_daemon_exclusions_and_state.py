@@ -647,3 +647,210 @@ class StagingDaemonRunTests(ScratchCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── E: the store's own namespace, and versions per PATH ──────────────────────
+#
+# Found by the independent review of 2026-09-11, all three by execution. The
+# version directories of every file in one source directory are siblings in
+# the store; anything that lists that directory without asking WHICH file a
+# version belongs to is a rule about the directory, not the path.
+
+
+class WalkStoreNamespaceTests(ScratchCase):
+    """Two shapes the walk refuses before they can reach the store."""
+
+    def walk(self):
+        seen = []
+        counters = DAEMON.Counters()
+        logger = _RecordingLogger()
+        root_fd = os.open(self.scratch, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            DAEMON.walk_root(
+                root_fd, counters, logger,
+                lambda _fd, _name, relpath: seen.append(relpath), self.scratch,
+            )
+        finally:
+            os.close(root_fd)
+        DAEMON._LOGGED_REFUSALS.clear()
+        return sorted(seen), counters, logger
+
+    def test_an_entry_named_like_a_version_key_is_refused_whether_file_or_directory(self):
+        key = dhu_backup_core.version_key(1_800_000_000_000_000_000, "0123456789abcdef")
+        self.write("docs/notes.md")
+        self.write("docs/%s/notes.md" % key)   # a DIRECTORY named like a version
+        self.write("docs/%s.txt" % key[:-4])   # not a key: the hash is 8 chars
+        self.write(key)                         # a FILE named like a version
+        seen, counters, logger = self.walk()
+        self.assertEqual(seen, ["docs/%s.txt" % key[:-4], "docs/notes.md"])
+        self.assertEqual(counters.refusals.get("walk-version-key-shaped"), 2)
+        self.assertTrue(any("named like a version key" in m for m in logger.infos))
+
+    def test_a_name_that_is_not_valid_utf8_is_refused_and_the_walk_continues(self):
+        """One such name used to abort EVERY scan of the whole root.
+
+        The OS hands the name back surrogate-escaped; the sqlite index and the
+        log both raise `UnicodeEncodeError` on it, and nothing in the walk
+        caught that, so the exception unwound the scan and the daemon reported
+        `scan-failed` until the file was removed. It is an ordinary refusal now,
+        with a counter, and the files after it are still captured.
+        """
+        self.write("aaa-first.md")
+        raw = os.path.join(self.scratch.encode("utf-8"), b"bad_\xff\xfe.md")
+        try:
+            with open(raw, "wb") as handle:
+                handle.write(b"x")
+        except OSError as exc:
+            if exc.errno != errno.EILSEQ:
+                raise
+            # APFS refuses to CREATE such a name, so on macOS the refusal is
+            # unreachable and this test proves it on Linux (ext4 accepts any
+            # bytes). A skip with the platform's own reason, not a silent pass.
+            self.skipTest("this filesystem refuses non-UTF-8 names (EILSEQ); proven on Linux")
+        self.write("zzz-last.md")
+        seen, counters, logger = self.walk()
+        self.assertEqual(seen, ["aaa-first.md", "zzz-last.md"])
+        self.assertEqual(counters.refusals.get("walk-name-not-utf8"), 1)
+        message = [m for m in logger.infos if "not valid UTF-8" in m]
+        self.assertEqual(len(message), 1)
+        message[0].encode("utf-8")  # the log line itself must be writable
+
+
+class ExistingVersionsPerPathTests(ScratchCase):
+    """`existing_versions` answers for ONE path, identified by its leaf."""
+
+    def version(self, directory, day, sha, leaf):
+        key = dhu_backup_core.version_key(day * 86_400 * 10 ** 9, sha)
+        path = os.path.join(self.scratch, directory, key)
+        os.makedirs(path, 0o755)
+        with open(os.path.join(path, leaf), "w") as handle:
+            handle.write("v")
+        return key
+
+    def test_only_this_leafs_versions_are_returned_oldest_first(self):
+        a3 = self.version("d", 3, "a" * 64, "a.md")
+        b1 = self.version("d", 1, "b" * 64, "b.md")
+        a2 = self.version("d", 2, "c" * 64, "a.md")
+        held = DAEMON.existing_versions(os.path.join(self.scratch, "d"), "a.md")
+        self.assertEqual([row[0] for row in held], [a2, a3])
+        self.assertEqual([row[2] for row in held], ["c" * 12, "a" * 12])
+        self.assertEqual([row[0] for row in DAEMON.existing_versions(
+            os.path.join(self.scratch, "d"), "b.md")], [b1])
+
+    def test_a_path_with_no_versions_and_a_missing_directory_both_answer_empty(self):
+        self.version("d", 1, "b" * 64, "b.md")
+        self.assertEqual(DAEMON.existing_versions(os.path.join(self.scratch, "d"), "a.md"), [])
+        self.assertEqual(DAEMON.existing_versions(os.path.join(self.scratch, "absent"), "a.md"), [])
+
+    def test_the_rolling_window_is_fed_one_paths_versions_not_the_directorys(self):
+        """The population that broke: 230 files in one directory, one version each.
+
+        Fed the directory's versions, the window rolled at 200 and deleted the
+        only copies of 30 siblings. Fed one path's, the plan is empty.
+        """
+        for index in range(230):
+            self.version("d", index + 1, "%064x" % index, "f%d.txt" % index)
+        held = DAEMON.existing_versions(os.path.join(self.scratch, "d"), "f0.txt")
+        plan = dhu_backup_core.version_window_plan(
+            [(key, epoch_ns) for key, epoch_ns, _sha in held], 200)
+        self.assertEqual(len(held), 1)
+        self.assertEqual(plan, [])
+
+
+class IndexReconciliationTests(ScratchCase):
+    """A row the store no longer backs is forgotten, so the file is captured again."""
+
+    def setUp(self):
+        super(IndexReconciliationTests, self).setUp()
+        self.config = DAEMON.Config({"root": self.scratch}, "test.conf")
+        os.makedirs(self.config.var_dir, 0o755)
+        os.makedirs(self.config.store_dir, 0o755)
+        os.makedirs(self.config.vault_dir, 0o700)
+        self.connection = DAEMON.open_index(self.config)
+        self.addCleanup(self.connection.close)
+        self.logger = _RecordingLogger()
+        self.watch_root = "/home/you/proj"
+        self.slug = dhu_backup_core.root_slug("proj", self.watch_root)
+
+    def remember(self, relpath):
+        self.connection.execute(
+            "INSERT INTO files (root_id, watch_root, relpath, size, mtime_ns, sha256,"
+            " first_seen, last_seen) VALUES (?, ?, ?, 1, 1, 'x', 1, 1)",
+            ("proj", self.watch_root, relpath))
+        self.connection.commit()
+
+    def hold(self, tree, relpath):
+        key = dhu_backup_core.version_key(10 ** 18, "a" * 64)
+        path = os.path.join(self.config.tree_dir(tree),
+                            dhu_backup_core.version_subpath("proj", self.slug, relpath, key))
+        os.makedirs(os.path.dirname(path), 0o755)
+        with open(path, "w") as handle:
+            handle.write("v")
+
+    def rows(self):
+        return sorted(r[0] for r in self.connection.execute("SELECT relpath FROM files"))
+
+    def test_rows_without_a_version_are_forgotten_and_backed_rows_kept(self):
+        self.remember("docs/kept.md")
+        self.hold("store", "docs/kept.md")
+        self.remember("docs/lost.md")           # its version was rolled away
+        self.remember(".env.local")
+        self.hold("vault", ".env.local")        # held in the OTHER tree
+        forgotten = DAEMON.reconcile_index_with_store(self.config, self.connection, self.logger)
+        self.assertEqual(forgotten, 1)
+        self.assertEqual(self.rows(), [".env.local", "docs/kept.md"])
+        self.assertTrue(any("captured again" in m for m in self.logger.warnings))
+
+    def test_a_sibling_with_versions_does_not_vouch_for_a_path_without(self):
+        # The directory-level mistake, restated for the index: `busy.md` having
+        # versions in `docs/` says nothing about `lost.md` in the same directory.
+        self.remember("docs/busy.md")
+        self.hold("store", "docs/busy.md")
+        self.remember("docs/lost.md")
+        DAEMON.reconcile_index_with_store(self.config, self.connection, self.logger)
+        self.assertEqual(self.rows(), ["docs/busy.md"])
+
+    def test_nothing_to_forget_is_silent(self):
+        self.remember("docs/kept.md")
+        self.hold("store", "docs/kept.md")
+        self.assertEqual(
+            DAEMON.reconcile_index_with_store(self.config, self.connection, self.logger), 0)
+        self.assertEqual(self.logger.warnings, [])
+        # And the store itself was not touched: reconciliation only deletes rows.
+        self.assertTrue(os.path.isdir(os.path.join(self.config.store_dir, "proj")))
+
+
+class WorktreesCoverageTests(ScratchCase):
+    """The repo walk skips `.claude/worktrees` only when another root covers it."""
+
+    def walk(self, worktrees_covered):
+        seen = []
+        counters = DAEMON.Counters()
+        root_fd = os.open(self.scratch, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            DAEMON.walk_root(root_fd, counters, _RecordingLogger(),
+                             lambda _fd, _name, relpath: seen.append(relpath), self.scratch,
+                             worktrees_covered=worktrees_covered)
+        finally:
+            os.close(root_fd)
+        DAEMON._LOGGED_REFUSALS.clear()
+        return sorted(seen), counters
+
+    def test_uncovered_worktrees_are_walked_and_covered_ones_are_skipped(self):
+        self.write("src/app.ts")
+        self.write(".claude/worktrees/agent-x/src/app.ts")
+        seen, counters = self.walk(worktrees_covered=False)
+        self.assertIn(".claude/worktrees/agent-x/src/app.ts", seen)
+        self.assertNotIn("walk-excluded-dir", counters.refusals)
+        seen, counters = self.walk(worktrees_covered=True)
+        self.assertEqual(seen, ["src/app.ts"])
+        self.assertEqual(counters.refusals.get("walk-excluded-dir"), 1)
+
+    def test_coverage_is_a_fact_about_the_other_roots(self):
+        covered = DAEMON.worktrees_covered_by_another_root
+        roots = [("repo", "/home/you/proj"), ("wt", "/home/you/proj/.claude/worktrees/agent-a")]
+        self.assertTrue(covered("/home/you/proj", roots))
+        self.assertTrue(covered("/home/you/proj/", roots))
+        self.assertFalse(covered("/home/you/proj/.claude/worktrees/agent-a", roots))
+        self.assertFalse(covered("/home/you/proj", [("repo", "/home/you/proj")]))
+        self.assertFalse(covered("/home/you/proj", [("other", "/home/you/proj2/.claude/worktrees/x")]))

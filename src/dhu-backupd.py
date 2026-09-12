@@ -337,21 +337,35 @@ def measure_store_bytes(store_dir):
     return total
 
 
-def existing_versions(path_dir):
-    """(version keys, sha prefixes) already held for one mirrored path."""
-    keys = []
-    shas = set()
+def existing_versions(path_dir, leaf):
+    """`[(version_key, capture_epoch_ns, sha_prefix)]` held for ONE mirrored path,
+    oldest first.
+
+    `path_dir` holds the version directories of EVERY file in one source
+    directory; the LEAF (the original basename) is what says which of them
+    belong to this path. The first shipped version took `path_dir` alone and
+    handed the whole directory's versions to the rolling window, which then
+    "rolled" the only versions of sibling files (independent review,
+    2026-09-11: a 342-file directory held exactly 200, one per file for the
+    200 luckiest). A version directory holds exactly one leaf, so membership is
+    one `lstat` per candidate, no listing.
+    """
+    held = []
     try:
-        for name in os.listdir(path_dir):
-            parsed = dhu_backup_core.parse_version_key(name)
-            if parsed is None:
-                continue
-            keys.append(name)
-            shas.add(parsed[1])
+        names = os.listdir(path_dir)
     except OSError as exc:
         if exc.errno != errno.ENOENT:
             raise
-    return keys, shas
+        return held
+    for name in names:
+        parsed = dhu_backup_core.parse_version_key(name)
+        if parsed is None:
+            continue
+        if not os.path.lexists(os.path.join(path_dir, name, leaf)):
+            continue
+        held.append((name, parsed[0], parsed[1]))
+    held.sort(key=lambda row: (row[1], row[0]))
+    return held
 
 
 def write_version(config, tree, root_id, slug, relpath, payload, digest, logger):
@@ -555,6 +569,17 @@ def _safe_mtime(path):
         return 0
 
 
+def worktrees_covered_by_another_root(watch_root, roots):
+    """Does some OTHER expanded root sit under this root's `.claude/worktrees`?
+
+    Only then does the walk skip that directory under `watch_root`: the
+    worktrees are captured under their own roots, and walking them here too
+    would store every file twice. With no such root they are walked here.
+    """
+    prefix = os.path.join(watch_root.rstrip("/"), ".claude", "worktrees") + "/"
+    return any(other.startswith(prefix) for _root_id, other in roots)
+
+
 # ── the walk (C6 / C7 / C8) ───────────────────────────────────────────────────
 
 
@@ -572,7 +597,8 @@ def open_root_fd(path):
 MAX_WALK_DEPTH = 32
 
 
-def walk_root(root_fd, counters, logger, on_file, absolute_root=None, exclude_globs=()):
+def walk_root(root_fd, counters, logger, on_file, absolute_root=None, exclude_globs=(),
+              worktrees_covered=False):
     """Depth-first walk over directory file descriptors. Does not close root_fd.
 
     No path string is ever re-resolved (C8): each directory is opened
@@ -594,11 +620,12 @@ def walk_root(root_fd, counters, logger, on_file, absolute_root=None, exclude_gl
     than this walk, it would be admitted rather than excluded — the direction
     that protects MORE, which is the safe one for a subtractive rule.
     """
-    _walk_dir(root_fd, "", counters, logger, on_file, 0, absolute_root, exclude_globs)
+    _walk_dir(root_fd, "", counters, logger, on_file, 0, absolute_root, exclude_globs,
+              worktrees_covered)
 
 
 def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=None,
-              exclude_globs=()):
+              exclude_globs=(), worktrees_covered=False):
     if absolute_dir is not None and len(counters.directories) < MAX_WATCHED_DIRS:
         # Path strings collected here feed the kqueue TRIGGER only. Capture
         # itself never re-resolves a path (C8); a trigger fd pointing somewhere
@@ -610,13 +637,33 @@ def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=N
             for entry in iterator:
                 child_rel = "%s/%s" % (relative_dir, entry.name) if relative_dir else entry.name
                 try:
+                    if dhu_backup_core.parse_version_key(entry.name) is not None:
+                        # The store's own namespace. A source entry named like a
+                        # version key would be listed by the reader, the prune
+                        # and the rolling window as a version of its siblings.
+                        counters.refuse("walk-version-key-shaped")
+                        log_refusal_once(logger, "vkey|" + child_rel,
+                                         "refusing an entry named like a version key: %s"
+                                         % child_rel)
+                        continue
+                    if not _utf8_encodable(entry.name):
+                        # Surrogate-escaped by the OS; neither the sqlite index
+                        # nor the log can take it, and one such name aborted
+                        # every scan of its whole root (independent review,
+                        # 2026-09-11). Refused and counted, like any other entry.
+                        counters.refuse("walk-name-not-utf8")
+                        log_refusal_once(logger, "utf8|" + _printable(child_rel),
+                                         "refusing a name that is not valid UTF-8: %s"
+                                         % _printable(child_rel))
+                        continue
                     if entry.is_symlink():
                         counters.refuse("walk-symlink")
                         log_refusal_once(logger, "sym|" + child_rel,
                                          "not following symlink: %s" % child_rel)
                         continue
                     if entry.is_dir(follow_symlinks=False):
-                        if dhu_backup_core.is_excluded_dir(entry.name, child_rel):
+                        if dhu_backup_core.is_excluded_dir(entry.name, child_rel,
+                                                           worktrees_covered):
                             counters.refuse("walk-excluded-dir")
                             log_refusal_once(logger, "exdir|" + child_rel,
                                              "not descending excluded dir: %s" % child_rel)
@@ -666,13 +713,26 @@ def _walk_dir(fd, relative_dir, counters, logger, on_file, depth, absolute_dir=N
         try:
             _walk_dir(child_fd, child_rel, counters, logger, on_file, depth + 1,
                       os.path.join(absolute_dir, name) if absolute_dir else None,
-                      exclude_globs)
+                      exclude_globs, worktrees_covered)
         finally:
             os.close(child_fd)
 
 
 def _errname(exc):
     return errno.errorcode.get(getattr(exc, "errno", None), str(getattr(exc, "errno", "?")))
+
+
+def _utf8_encodable(name):
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _printable(text):
+    """A log-safe rendering of a name that may carry surrogate escapes."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 MAX_LOGGED_REFUSAL_KEYS = 5000
@@ -1264,11 +1324,18 @@ def scan_once(config, connection, logger, state):
                     config.tree_dir(tree),
                     dhu_backup_core.path_subpath(_root_id, _slug, relpath),
                 )
-                names, shas = existing_versions(path_dir)
-                if digest in shas:
+                held = existing_versions(path_dir, os.path.basename(relpath))
+                if held and held[-1][2] == digest[:dhu_backup_core.VERSION_HASH_CHARS]:
                     counters.already_held += 1
-                    # Content already held (a touch, or a revert). Refresh the
-                    # index so we stop hashing it every cycle.
+                    # The NEWEST version of this path already holds these bytes
+                    # (a `touch`, or a rewrite with the same content). Refresh
+                    # the index so we stop hashing it every cycle. Only the
+                    # newest is compared: a revert to OLDER content is a real
+                    # change and gets its own version, so `--asof` and `restore`
+                    # describe what the file actually held. The first shipped
+                    # version compared the full 64-hex digest against 12-hex
+                    # prefixes, so this branch never ran and every `touch`
+                    # wrote a duplicate version (independent review, 2026-09-11).
                     _remember(connection, _root_id, _watch_root, relpath, st, digest, now, row)
                     return
 
@@ -1307,7 +1374,7 @@ def scan_once(config, connection, logger, state):
                 # thing missing from the store. Ordering is by the capture clock
                 # in the key (C12), so `touch -t` cannot choose what is dropped.
                 window = dhu_backup_core.version_window_plan(
-                    [(key, dhu_backup_core.parse_version_key(key)[0]) for key in names],
+                    [(key, epoch_ns) for key, epoch_ns, _sha in held],
                     config.limits.max_versions_per_path,
                 )
                 if window:
@@ -1357,7 +1424,8 @@ def scan_once(config, connection, logger, state):
 
         try:
             walk_root(root_fd, counters, logger, handle_file, watch_root,
-                      exclude_globs=config.exclude_globs)
+                      exclude_globs=config.exclude_globs,
+                      worktrees_covered=worktrees_covered_by_another_root(watch_root, roots))
         finally:
             os.close(root_fd)
 
@@ -1419,12 +1487,17 @@ def _remember(connection, root_id, watch_root, relpath, st, digest, now, previou
 
 
 def collect_index_rows(tree_root):
-    """[(path_dir, version_key, capture_epoch_ns)] for every version in a tree.
+    """[(path_dir, leaf, version_key, capture_epoch_ns)] for every version in a tree.
 
     Walks the mirrored tree looking for directories whose name parses as a
     version key. The capture clock comes from that key and from nowhere else
     (C12) — never from the stored file's mtime, which is a copy of an
-    agent-controlled value.
+    agent-controlled value. The LEAF is part of the row because it is what
+    identifies the path: version directories of every file in one source
+    directory are siblings, and a plan keyed on the directory alone kept one
+    version per directory (independent review, 2026-09-11). A version
+    directory with no leaf (a crash between mkdir and link) carries `None` and
+    ages out like any other.
     """
     rows = []
     for dirpath, dirnames, _filenames in os.walk(tree_root):
@@ -1433,8 +1506,47 @@ def collect_index_rows(tree_root):
             if parsed is None:
                 continue
             dirnames.remove(name)  # a version directory holds one leaf; do not descend
-            rows.append((dirpath, name, parsed[0]))
+            leaves = _listdir(os.path.join(dirpath, name))
+            rows.append((dirpath, leaves[0] if leaves else None, name, parsed[0]))
     return rows
+
+
+def held_paths(tree_root):
+    """`{(path_dir, leaf)}` — every mirrored path with at least one version."""
+    return set((path_dir, leaf) for path_dir, leaf, _name, _ns in collect_index_rows(tree_root)
+               if leaf is not None)
+
+
+def reconcile_index_with_store(config, connection, logger):
+    """Forget index rows whose path has NO version left in either tree.
+
+    The index short-circuits a file whose size and mtime are unchanged, so a
+    file whose versions were removed from the store (by the directory-keyed
+    window and prune that shipped first — independent review, 2026-09-11)
+    stays unprotected until it changes. Dropping its row makes the next scan
+    hash and capture it again. Runs at start and after every prune, and it
+    only ever DELETES INDEX ROWS: the store is not touched. Returns the count.
+    """
+    held = held_paths(config.store_dir) | held_paths(config.vault_dir)
+    rows = connection.execute("SELECT root_id, watch_root, relpath FROM files").fetchall()
+    forgotten = 0
+    for root_id, watch_root, relpath in rows:
+        if not dhu_backup_core.is_safe_relpath(relpath):
+            continue
+        slug = dhu_backup_core.root_slug(root_id, watch_root)
+        tree = dhu_backup_core.destination_for(relpath, config.extra_vault_globs)
+        path_dir = os.path.join(config.tree_dir(tree),
+                                dhu_backup_core.path_subpath(root_id, slug, relpath))
+        if (path_dir, os.path.basename(relpath)) in held:
+            continue
+        connection.execute("DELETE FROM files WHERE watch_root = ? AND relpath = ?",
+                           (watch_root, relpath))
+        forgotten += 1
+    connection.commit()
+    if forgotten:
+        logger.warn("index: %d indexed path(s) had no version in the store and will be "
+                    "captured again on the next scan" % forgotten)
+    return forgotten
 
 
 def _listdir(path):
@@ -1518,6 +1630,7 @@ def _prune_and_record(config, connection, logger, state):
         removed, freed, failed = run_prune(config, connection, logger)
         state["prune_last_removed"] = removed
         state["prune_last_failed"] = failed
+        state["index_reconciled"] = reconcile_index_with_store(config, connection, logger)
         if failed:
             logger.error("prune could not remove %d version(s)" % failed)
     except Exception as exc:  # noqa: BLE001
@@ -1807,6 +1920,11 @@ def main(argv=None):
                     "over the limit, those directories fall back to the floor sweep)"
                     % (trigger.watch_limit if trigger.watch_limit is not None
                        else "UNREADABLE " + INOTIFY_MAX_USER_WATCHES))
+
+    # A path the index remembers but the store no longer holds is a path that
+    # would never be captured again. Checked once at start (the store built by
+    # the first shipped version has such paths) and after every prune.
+    state["index_reconciled"] = reconcile_index_with_store(config, connection, logger)
 
     last_prune = 0.0
     if args.prune_now:

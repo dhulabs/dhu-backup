@@ -8,7 +8,7 @@ Both platforms, the same command, the system interpreter:
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-618 tests. Green on macOS under Python 3.9 and on Ubuntu under Python 3.14. Use
+635 tests. Green on macOS under Python 3.9 and on Ubuntu under Python 3.14. Use
 `/usr/bin/python3` rather than whatever is first on `PATH`: the daemon runs
 under the system interpreter with `-E -s -S`, and a test run under a pyenv or
 homebrew Python is not testing the thing that ships.
@@ -77,6 +77,17 @@ environment names a path that does not exist, let it raise: an error is loud and
 a skip is not. The same rule governs fixtures — a population derived from a
 guard's *tests* is a claim about the tests, not about the guard.
 
+The second worked example cost real data. The store keeps the version
+directories of every file in one source directory as siblings, and both
+retention plans were keyed on that directory rather than on the file: the
+rolling window rolled the only versions of a busy file's siblings, and the age
+prune would have kept one version per directory. Every test of both plans used
+one file per directory, so every test passed. The population the tests drew
+from was not the population the daemon fed the function. When a function is
+called on data the daemon builds, at least one test has to build that data the
+same way the daemon does — several files in one directory, here — rather than
+the simplest shape that satisfies the signature.
+
 **No silent fallbacks. Every status distinguishes reported, missing and
 degraded.** "I looked and there is nothing" and "I could not look" are opposite
 claims, and code that collapses them abandons work that is sitting on disk.
@@ -133,3 +144,12 @@ what was run to check it. This project's most useful findings came from running
 it rather than reading it — a FIFO that hangs the open, a 0444 index that breaks
 sqlite, a symlink rule that was dead code because the caller ran realpath first.
 Reading found none of those.
+
+## The review numbering in the source
+
+Comments and docstrings cite findings as `C5`, `H2`, `M8`, `I3`, `A2` and
+"round 2". Those are the numbered findings of a pre-release adversarial review
+that is not published, because it quotes a private codebase. The reasoning
+behind each citation is restated where it is cited, so nothing in this
+repository depends on reading it; the numbers are kept so the history of a
+decision can be traced by the people who hold that document.

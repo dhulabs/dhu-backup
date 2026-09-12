@@ -1505,3 +1505,32 @@ class StatusMcpToolTests(FixtureCase):
         spec.loader.exec_module(module)
         tool = [t for t in module.TOOLS if t["name"] == "dhu_backup_status"][0]
         self.assertEqual(tool["annotations"], module.READ_ONLY)
+
+
+class FabricatedVersionShapeTests(FixtureCase):
+    """A directory under a version-shaped name is not a version.
+
+    An agent can name a directory in its own tree like a version key, and a
+    store written before the walk refused that shape can hold it as a sibling
+    of real versions. Listed as a version, its "leaf" is a directory: `log`
+    showed a version dated in the future and `cat` opened a directory and
+    raised. The reader now requires a regular file where the leaf should be.
+    """
+
+    def setUp(self):
+        super(FabricatedVersionShapeTests, self).setUp()
+        self.helper = load_helper_module()
+        fake = os.path.join(self.install_root, "store", "repo", "demo-aaaaaaaa",
+                            "@1800000000000000000-0123456789ab", "@%019d-0000000000ff" % T1)
+        os.makedirs(fake, 0o755)
+        with open(os.path.join(fake, "notes.md"), "w") as handle:
+            handle.write("FAKE\n")
+
+    def test_the_fabricated_entry_is_not_listed_and_real_entries_are_unchanged(self):
+        entries, error = self.helper.load_entries(self.install_root)
+        self.assertIsNone(error)
+        self.assertEqual(len(entries), 4)
+        for entry in entries:
+            for version in entry["versions"]:
+                self.assertTrue(os.path.isfile(version["path"]), version["path"])
+                self.assertNotIn("@1800000000000000000", version["path"])

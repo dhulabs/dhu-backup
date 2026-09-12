@@ -184,6 +184,26 @@ with a marker.
 Nothing is ever overwritten. A version is created with `os.link()`, which fails
 `EEXIST` rather than clobbering. Append-only is enforced by the kernel.
 
+One consequence of this layout is easy to get wrong, and the first two releases
+did: the version directories of **every file in one source directory are
+siblings** under the same `<relpath-dir>`, and only the leaf says which file a
+version belongs to. A rule that lists a `<relpath-dir>` without asking about the
+leaf is a rule about the directory, not the path. The rolling window and the
+age prune both did that in v0.1.0 and v0.2.0 — the window rolled the only
+versions of a busy file's siblings, and the prune would have kept one version
+per directory ([PROOFS §6](PROOFS.md#6-the-independent-review-of-2026-09-11)).
+Every retention decision is now keyed on `(relpath-dir, leaf)`, and the daemon
+forgets any indexed path the store no longer holds a version of, so it is
+captured again on the next scan.
+
+The walk also refuses two shapes at the source, before they can reach the
+store: an entry whose **name parses as a version key**, which would otherwise
+sit in the store's own namespace and be listed by the reader and the retention
+plans as a version of its siblings; and a name that is **not valid UTF-8**,
+which neither the sqlite index nor the log can take — one such name, handed
+over surrogate-escaped by the OS, aborted every scan of its whole root until it
+was removed. Both are ordinary refusals now, counted under their own reasons.
+
 ## The split store and the credential predicate
 
 `store/` is 0755 and agent-readable. `vault/` is 0700 and root-only. One
@@ -308,7 +328,9 @@ reads mid-session.
 
 It now rolls: the daemon prunes that path's oldest versions down to `cap - 1`
 and writes the new one, through the same executor as age pruning, so retention
-stays daemon-only. The newest version of a path is never in either plan.
+stays daemon-only. The newest version of a path is never in either plan —
+and "path" means the file, `(relpath-dir, leaf)`, not the directory its versions
+share with its siblings' (see the layout section above).
 
 The accepted cost is that an agent can push its own older versions of **one**
 file out of the store by rewriting it 200 times. That is worse than nothing and
@@ -382,6 +404,11 @@ to read anywhere. `state` is one of five:
 - **unprotected** — the daemon is healthy and has no usable watch root, so
   nothing is being protected
 - **scan-failed** — the daemon is running and every scan is throwing
+
+The helper's `health` verdict uses these five plus three of its own for what the
+daemon cannot say about itself — `stale` (no scan for five minutes),
+`no-heartbeat` and `unreadable-heartbeat` — which is the eight-verdict
+vocabulary the README counts. The daemon never writes those three.
 
 The first build collapsed the last two into `ok` with a zero file count, and a
 boot banner then announced that uncommitted work was protected over an empty

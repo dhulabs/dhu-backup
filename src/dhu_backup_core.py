@@ -129,12 +129,20 @@ EXCLUDED_EXTENSIONS = frozenset(
 )
 
 
-def is_excluded_dir(name, relpath):
+def is_excluded_dir(name, relpath, worktrees_covered=False):
     """Should the walk refuse to DESCEND into this directory?
 
     `relpath` is the directory's path relative to its watch root. Checked before
     descending, so a multi-gigabyte artifact tree costs one `scandir` entry
     rather than a walk (review H5).
+
+    `worktrees_covered` says whether ANOTHER watch root sits under this root's
+    `.claude/worktrees`. Only then is that directory skipped here — it is being
+    captured under its own root. The default is the direction that protects
+    more: the first two releases skipped it unconditionally, on the strength of
+    a shipped watchlist that no longer ships, so a repository watched with a
+    single `--watch` had its agent worktrees walked by nothing (independent
+    review, 2026-09-11 — the founding incident's exact shape).
 
     Every rule is POSITION-RELATIVE, matched on the tail of the relpath rather
     than anchored at the watch root. The first version anchored `lib/generated`
@@ -157,13 +165,14 @@ def is_excluded_dir(name, relpath):
     # before and would not have been (round-2 review, M8).
     if name == "bundles" and "deploy" in segments[:-1]:
         return True
-    # `.claude/worktrees` — agent worktrees have their OWN watch root, so
-    # walking them from the repo root as well stored every worktree file twice,
-    # under two different store keys, against the same budgets (adversarial review).
-    # This is only safe because the shipped watchlist globs `worktrees/*`, i.e.
-    # EVERY child. It once globbed `agent-*`, and this exclusion then silently
-    # removed all protection from a worktree named anything else (round 2, I3).
-    if len(segments) >= 2 and segments[-2:] == [".claude", "worktrees"]:
+    # `.claude/worktrees` — when agent worktrees have their OWN watch root,
+    # walking them from the repo root as well stores every worktree file twice,
+    # under two different store keys, against the same budgets (adversarial
+    # review). Skipped ONLY when the caller says such a root exists. It once
+    # globbed `agent-*`, and this exclusion then silently removed all protection
+    # from a worktree named anything else (round 2, I3); unconditional, it did
+    # the same to every operator who never named a worktrees root at all.
+    if worktrees_covered and len(segments) >= 2 and segments[-2:] == [".claude", "worktrees"]:
         return True
     return False
 
@@ -500,6 +509,21 @@ def is_safe_relpath(relpath):
     parts = normalized.split("/")
     if any(p == ".." for p in parts):
         return False
+    # Two shapes the STORE itself relies on, refused at the source so that an
+    # agent-named entry can never sit in the daemon's own namespace (independent
+    # review, 2026-09-11). A component shaped like a version key
+    # (`@<ns>-<sha12>`) would be listed by the reader, the prune and the rolling
+    # window as a version of its sibling files. A name that is not valid UTF-8
+    # (the OS hands it over surrogate-escaped) cannot be written to the sqlite
+    # index or the log, and one such name aborted every scan of its whole root
+    # with `UnicodeEncodeError`, reported as `scan-failed` for as long as it
+    # existed.
+    if any(parse_version_key(p) is not None for p in parts):
+        return False
+    try:
+        relpath.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
     return True
 
 
@@ -828,7 +852,11 @@ def entry_budget_decision(incoming_bytes, new_files_this_scan, limits=DEFAULT_LI
 def prune_plan(index_rows, now_ns, window_ns):
     """Version directories eligible for deletion. Returns a PLAN; deletes nothing.
 
-    `index_rows` is an iterable of `(path_dir, version_key, capture_epoch_ns)`.
+    `index_rows` is an iterable of `(path_dir, leaf, version_key, capture_epoch_ns)`.
+    A mirrored PATH is identified by `(path_dir, leaf)`: in the store layout the
+    version directories of every file in one source directory are siblings
+    under the same `path_dir`, and only the leaf (the original basename) says
+    which file a version belongs to. The plan is `[(path_dir, version_key)]`.
 
     Two rules, and the second is the one that makes the first safe:
 
@@ -837,22 +865,30 @@ def prune_plan(index_rows, now_ns, window_ns):
     inverts for precisely the files most worth keeping. So the newest version of
     every path is never in the plan, whatever its age.
 
+    The first shipped version keyed "newest" by `path_dir` alone, which is the
+    newest version in the DIRECTORY, not of the path: after 30 days it would
+    have kept one version per directory and deleted the only copy of every
+    other file in it (independent review, 2026-09-11, measured against a real
+    store: 27,808 of 34,649 mirrored paths). The leaf is part of the identity
+    now, and the test population has two files in one directory for that reason.
+
     C12: the age compared here is the CAPTURE clock carried in the version key,
     never the source file's mtime. A source backdated to 1970 must not make its
     captured version prunable — that would be a delete path into the mirror
     driven from an agent-writable tree with one `touch`.
     """
-    newest_by_dir = {}
-    for store_dir, name, epoch_ns in index_rows:
-        current = newest_by_dir.get(store_dir)
+    newest_by_path = {}
+    for store_dir, leaf, name, epoch_ns in index_rows:
+        identity = (store_dir, leaf)
+        current = newest_by_path.get(identity)
         if current is None or epoch_ns > current[0] or (
             epoch_ns == current[0] and name > current[1]
         ):
-            newest_by_dir[store_dir] = (epoch_ns, name)
+            newest_by_path[identity] = (epoch_ns, name)
 
     plan = []
-    for store_dir, name, epoch_ns in index_rows:
-        if newest_by_dir[store_dir] == (epoch_ns, name):
+    for store_dir, leaf, name, epoch_ns in index_rows:
+        if newest_by_path[(store_dir, leaf)] == (epoch_ns, name):
             continue
         if now_ns - epoch_ns > window_ns:
             plan.append((store_dir, name))

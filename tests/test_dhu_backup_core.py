@@ -140,7 +140,7 @@ class ClassifyEntryTests(unittest.TestCase):
             "a/b/node_modules/x.md",
             ".git/config.txt",
             "lib/generated/prisma/client.md",
-            "deploy/inference-node/bundles/x.md",
+            "deploy/edge-node/bundles/x.md",
         ]:
             verdict = classify_entry(
                 os.path.basename(relpath), FakeStat(), relpath, owner_uid=OWNER_UID
@@ -163,7 +163,7 @@ class ClassifyEntryTests(unittest.TestCase):
         guards would refuse; `vault/` is root-only and holds the rest, so the
         owner can still recover a deleted `.env.local` with sudo.
         """
-        for relpath in [".env.local", "deploy/inference-node/id_rsa", ".ssh/known_hosts"]:
+        for relpath in [".env.local", "deploy/edge-node/id_rsa", ".ssh/known_hosts"]:
             verdict = classify_entry(
                 os.path.basename(relpath), FakeStat(), relpath, owner_uid=OWNER_UID
             )
@@ -284,6 +284,17 @@ class RelpathTests(unittest.TestCase):
 
 
 class PrunePlanTests(unittest.TestCase):
+    """Rows are `(path_dir, leaf, version_key, capture_ns)`; plans are `(path_dir, key)`.
+
+    The population here deliberately puts SEVERAL files in ONE directory. In the
+    store layout the version directories of every file in a source directory
+    are siblings, and the first shipped `prune_plan` keyed "newest" on the
+    directory alone — so it kept one version per directory and would have
+    deleted the only copy of every other file in it after 30 days. The earlier
+    tests used one file per directory and could not see that: the claim and
+    its evidence did not share a population.
+    """
+
     def test_empty_index_yields_an_empty_plan(self):
         self.assertEqual(prune_plan([], now_ns=10 ** 18, window_ns=30 * NS_PER_DAY), [])
 
@@ -292,15 +303,15 @@ class PrunePlanTests(unittest.TestCase):
         # version. Naive age-pruning deletes the ONLY copy of the stable files
         # most worth keeping — the guarantee inverts.
         now = 100 * NS_PER_DAY
-        rows = [("dirA", version_key(1 * NS_PER_DAY, "a" * 64), 1 * NS_PER_DAY)]
+        rows = [("dirA", "a.md", version_key(1 * NS_PER_DAY, "a" * 64), 1 * NS_PER_DAY)]
         self.assertEqual(prune_plan(rows, now, 30 * NS_PER_DAY), [])
 
     def test_newest_survives_even_when_every_version_is_ancient(self):
         now = 100 * NS_PER_DAY
         rows = [
-            ("dirA", version_key(1 * NS_PER_DAY, "a" * 64), 1 * NS_PER_DAY),
-            ("dirA", version_key(2 * NS_PER_DAY, "b" * 64), 2 * NS_PER_DAY),
-            ("dirA", version_key(3 * NS_PER_DAY, "c" * 64), 3 * NS_PER_DAY),
+            ("dirA", "a.md", version_key(1 * NS_PER_DAY, "a" * 64), 1 * NS_PER_DAY),
+            ("dirA", "a.md", version_key(2 * NS_PER_DAY, "b" * 64), 2 * NS_PER_DAY),
+            ("dirA", "a.md", version_key(3 * NS_PER_DAY, "c" * 64), 3 * NS_PER_DAY),
         ]
         plan = prune_plan(rows, now, 30 * NS_PER_DAY)
         self.assertEqual(len(plan), 2)
@@ -309,8 +320,8 @@ class PrunePlanTests(unittest.TestCase):
     def test_nothing_inside_the_window_is_pruned(self):
         now = 100 * NS_PER_DAY
         rows = [
-            ("dirA", version_key(80 * NS_PER_DAY, "a" * 64), 80 * NS_PER_DAY),
-            ("dirA", version_key(90 * NS_PER_DAY, "b" * 64), 90 * NS_PER_DAY),
+            ("dirA", "a.md", version_key(80 * NS_PER_DAY, "a" * 64), 80 * NS_PER_DAY),
+            ("dirA", "a.md", version_key(90 * NS_PER_DAY, "b" * 64), 90 * NS_PER_DAY),
         ]
         self.assertEqual(prune_plan(rows, now, 30 * NS_PER_DAY), [])
 
@@ -325,24 +336,91 @@ class PrunePlanTests(unittest.TestCase):
         now = 100 * NS_PER_DAY
         ancient_source_mtime = 1 * NS_PER_DAY
         rows = [
-            ("dirA", version_key(now - NS_PER_DAY, "a" * 64), now - NS_PER_DAY),
-            ("dirA", version_key(now, "b" * 64), now),
+            ("dirA", "a.md", version_key(now - NS_PER_DAY, "a" * 64), now - NS_PER_DAY),
+            ("dirA", "a.md", version_key(now, "b" * 64), now),
         ]
         plan = prune_plan(rows, now, 30 * NS_PER_DAY)
         self.assertEqual(plan, [], "a recent capture must never be prunable")
         # And the source mtime is not even representable in the row shape.
-        self.assertNotIn(ancient_source_mtime, [row[2] for row in rows])
+        self.assertNotIn(ancient_source_mtime, [row[3] for row in rows])
 
     def test_each_relpath_keeps_its_own_newest(self):
         now = 100 * NS_PER_DAY
         rows = []
         for directory in ("dirA", "dirB"):
             for day in (1, 2):
-                rows.append((directory, version_key(day * NS_PER_DAY, "a" * 64), day * NS_PER_DAY))
+                rows.append((directory, "f.md", version_key(day * NS_PER_DAY, "a" * 64),
+                             day * NS_PER_DAY))
         plan = prune_plan(rows, now, 30 * NS_PER_DAY)
         pruned_dirs = sorted(set(d for d, _ in plan))
         self.assertEqual(pruned_dirs, ["dirA", "dirB"])
-        self.assertEqual(len(plan), 2)  # one per directory, the older one
+        self.assertEqual(len(plan), 2)  # one per path, the older one
+
+    def test_two_files_in_one_directory_each_keep_their_own_newest(self):
+        """The case the first shipped version got wrong.
+
+        `a.md` has one ancient version and `b.md` has two, all in the same
+        directory. Keyed on the directory, the plan kept b's newest and deleted
+        a's ONLY copy. Keyed on the path, a's survives and only b's older goes.
+        """
+        now = 100 * NS_PER_DAY
+        a_only = version_key(1 * NS_PER_DAY, "a" * 64)
+        b_old = version_key(2 * NS_PER_DAY, "b" * 64)
+        b_new = version_key(3 * NS_PER_DAY, "c" * 64)
+        rows = [
+            ("dir", "a.md", a_only, 1 * NS_PER_DAY),
+            ("dir", "b.md", b_old, 2 * NS_PER_DAY),
+            ("dir", "b.md", b_new, 3 * NS_PER_DAY),
+        ]
+        plan = prune_plan(rows, now, 30 * NS_PER_DAY)
+        self.assertEqual(plan, [("dir", b_old)])
+
+    def test_a_stable_file_survives_a_busy_sibling(self):
+        """One version of `stable.md`, fifty of `busy.md`, all beyond the window.
+
+        Exactly one version per PATH must survive: the stable file's only copy
+        and the busy file's newest. A plan that removed 50 of 51 would have
+        kept one per directory.
+        """
+        now = 100 * NS_PER_DAY
+        rows = [("dir", "stable.md", version_key(1 * NS_PER_DAY, "0" * 64), 1 * NS_PER_DAY)]
+        for day in range(2, 52):
+            rows.append(("dir", "busy.md", version_key(day * NS_PER_DAY, "%064x" % day),
+                         day * NS_PER_DAY))
+        plan = prune_plan(rows, now, 30 * NS_PER_DAY)
+        self.assertEqual(len(plan), 49)
+        self.assertNotIn(("dir", rows[0][2]), plan, "the stable file's only copy")
+        self.assertNotIn(("dir", rows[-1][2]), plan, "the busy file's newest")
+
+    def test_a_version_directory_with_no_leaf_ages_out_like_any_other(self):
+        # A crash between mkdir and link leaves `@key/` empty; its leaf is None.
+        now = 100 * NS_PER_DAY
+        rows = [
+            ("dir", None, version_key(1 * NS_PER_DAY, "a" * 64), 1 * NS_PER_DAY),
+            ("dir", None, version_key(2 * NS_PER_DAY, "b" * 64), 2 * NS_PER_DAY),
+        ]
+        self.assertEqual(prune_plan(rows, now, 30 * NS_PER_DAY),
+                         [("dir", version_key(1 * NS_PER_DAY, "a" * 64))])
+
+
+class StoreNamespaceRelpathTests(unittest.TestCase):
+    """`is_safe_relpath` refuses the two shapes the store itself cannot hold."""
+
+    def test_a_component_shaped_like_a_version_key_is_unsafe(self):
+        key = version_key(1_700_000_000_000_000_000, "0123456789abcdef")
+        for bad in (key, key + "/x.md", "docs/" + key, "docs/" + key + "/notes.md"):
+            self.assertFalse(is_safe_relpath(bad), bad)
+
+    def test_an_at_sign_alone_is_not_the_store_namespace(self):
+        for good in ("@readme", "a@b.md", "@1-xyz", "@notakey/x.md", "user@host/notes.md"):
+            self.assertTrue(is_safe_relpath(good), good)
+
+    def test_a_name_that_is_not_valid_utf8_is_unsafe(self):
+        # What the OS hands back for the bytes b"bad_\xff": surrogate-escaped.
+        escaped = b"bad_\xff".decode("utf-8", "surrogateescape")
+        self.assertFalse(is_safe_relpath(escaped))
+        self.assertFalse(is_safe_relpath("docs/" + escaped))
+        self.assertTrue(is_safe_relpath("docs/caf\u00e9.md"))
 
 
 # ── budget_decision (C11) ─────────────────────────────────────────────────────
@@ -603,20 +681,26 @@ class ExcludedDirTests(unittest.TestCase):
         ]:
             self.assertTrue(is_excluded_dir("generated", relpath), relpath)
         for relpath in [
-            "deploy/inference-node/bundles",
-            ".claude/worktrees/agent-x/deploy/inference-node/bundles",
-            "deploy/inference-node/media-server/bundles",
+            "deploy/edge-node/bundles",
+            ".claude/worktrees/agent-x/deploy/edge-node/bundles",
+            "deploy/edge-node/media-server/bundles",
         ]:
             self.assertTrue(is_excluded_dir("bundles", relpath), relpath)
 
-    def test_excludes_the_worktrees_directory_from_the_repo_walk(self):
-        # Worktrees have their own watch root; walking them from the repo root
-        # too stored every worktree file twice under two keys. This is only safe
-        # because the shipped watchlist globs EVERY child, which the next test
-        # pins against the shipped file.
+    def test_the_worktrees_directory_is_walked_unless_another_root_covers_it(self):
+        """The founding incident's shape: an agent's worktree, protected by nothing.
+
+        Unconditionally skipped in the first two releases, `.claude/worktrees`
+        under a repository watched with one `--watch` was walked by nothing at
+        all. It is walked now unless the daemon says another root covers it.
+        """
         for relpath in [".claude/worktrees", "a/b/.claude/worktrees"]:
-            self.assertTrue(is_excluded_dir("worktrees", relpath), relpath)
-        self.assertFalse(is_excluded_dir("worktrees", "docs/worktrees"))
+            self.assertFalse(is_excluded_dir("worktrees", relpath), relpath)
+            self.assertFalse(is_excluded_dir("worktrees", relpath, worktrees_covered=False), relpath)
+            self.assertTrue(is_excluded_dir("worktrees", relpath, worktrees_covered=True), relpath)
+        # Coverage changes nothing else.
+        self.assertFalse(is_excluded_dir("worktrees", "worktrees", worktrees_covered=True))
+        self.assertTrue(is_excluded_dir("node_modules", "x/node_modules", worktrees_covered=True))
 
     def test_the_example_watchlist_globs_every_worktree_not_just_agent_star(self):
         """The exclusion above removes protection from whatever this misses.
@@ -681,7 +765,7 @@ class CredentialPathShapeTests(unittest.TestCase):
             ".ssh/config",
             "home/.gnupg/secring.gpg",
             "certs/server.pem",
-            "deploy/inference-node/id_ed25519",
+            "deploy/edge-node/id_ed25519",
         ]:
             self.assertIsNotNone(is_credential_path(relpath), relpath)
 
