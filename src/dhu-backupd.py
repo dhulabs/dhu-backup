@@ -1841,6 +1841,11 @@ def write_state(config, state, counters, store_bytes, free_bytes, roots, refused
         "interval_seconds": config.interval_seconds,
         "prune_last_removed": state.get("prune_last_removed"),
         "prune_last_failed": state.get("prune_last_failed"),
+        # How many indexed paths the last start or prune found no version of
+        # and forgot, so they are captured again. Non-zero once after an
+        # upgrade from v0.1.0/v0.2.0; non-zero on an ordinary day means
+        # something removed versions from the store, which only root can do.
+        "index_reconciled": state.get("index_reconciled"),
     }
     if warning is not None:
         # A LIST, always, even for one reason. Both triggers can be true at

@@ -1118,7 +1118,7 @@ record. The daemon's own capture log is the authoritative one.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-716 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
+717 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
 platform-aware rather than platform-specific: it asserts THIS platform's install
 surface, and asserts the other platform's through `--dry-run --platform`, which
 is what that flag exists for. Three tests that assert the scripts refuse without

@@ -297,6 +297,17 @@ class HeartbeatShapeTests(ScratchCase):
         self.assertNotIn("warning_reason", payload)
         self.assertNotIn("warning_detail", payload)
 
+    def test_the_reconciliation_count_is_in_the_heartbeat(self):
+        """The operator guide documents `index_reconciled`; the first build after
+        the review logged the count and left it out of the heartbeat, which is
+        a documented field that did not exist — found on the author's own
+        reinstall. None before the first start or prune has run, the count after."""
+        payload = self.publish(self.config())
+        self.assertIn("index_reconciled", payload)
+        self.assertIsNone(payload["index_reconciled"])
+        payload = self.publish(self.config(), state={"index_reconciled": 551})
+        self.assertEqual(payload["index_reconciled"], 551)
+
     def test_a_tight_volume_writes_warning_with_a_reason_LIST(self):
         config = self.config(min_free_bytes=10 * self.GiB)
         payload = self.publish(config, free_bytes=12 * self.GiB)
