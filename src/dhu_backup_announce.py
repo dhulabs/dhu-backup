@@ -504,9 +504,19 @@ def display_path(text, limit=DISPLAY_PATH_MAX):
     out = []
     for char in text:
         code = ord(char)
+        # By Unicode category as well as by list: Cc (controls), Cf (format —
+        # the bidi overrides and isolates, soft hyphen, word joiner, the tag
+        # block), Cs (surrogates), Zl/Zp (line and paragraph separators). An
+        # explicit list missed U+202E and friends (audit, 2026-09-12).
         if code < 0x20 or code == 0x7f or 0x80 <= code <= 0x9f or char in _INVISIBLE \
-                or 0xd800 <= code <= 0xdfff:
-            out.append("\\x%02x" % code if code < 0x100 else "\\u%04x" % code)
+                or 0xd800 <= code <= 0xdfff \
+                or unicodedata.category(char) in ("Cc", "Cf", "Cs", "Zl", "Zp"):
+            if code < 0x100:
+                out.append("\\x%02x" % code)
+            elif code <= 0xffff:
+                out.append("\\u%04x" % code)
+            else:
+                out.append("\\U%08x" % code)
         else:
             out.append(char)
     rendered = "".join(out)

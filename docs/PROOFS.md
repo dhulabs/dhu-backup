@@ -6,7 +6,7 @@ document. Home directories have been generalised to `/Users/you` and
 `/home/you`; nothing else in the observed output is edited. The machines are not
 identified.
 
-What CI does prove, on every push, is that the 717-test suite passes on a clean
+What CI does prove, on every push, is that the 720-test suite passes on a clean
 `macos-latest` and `ubuntu-latest` runner with nothing from a developer's own
 machine. What CI cannot prove is anything that needs a root daemon actually
 installed, which is everything below.

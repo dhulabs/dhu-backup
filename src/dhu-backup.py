@@ -992,7 +992,7 @@ def _restore_one(entry, version, args):
             return 0, "unchanged"
         # Never silently clobber, and never silently refuse either: write beside
         # it and say exactly what happened.
-        beside = "%s.restored-%s" % (destination, version["key"].lstrip("@"))
+        beside = _beside_name(destination, version["key"].lstrip("@"))
         try:
             _write(beside, payload)
         except (IOError, OSError) as exc:
@@ -1024,6 +1024,23 @@ def _oserror_text(exc):
     return "%s: %s" % (strerror, filename) if filename else strerror
 
 
+NAME_MAX = 255
+
+
+def _beside_name(destination, tag):
+    """`<destination>.restored-<tag>`, shortened to fit NAME_MAX when the
+    basename is long: a captured name may be 255 bytes, and a suffix that pushed
+    it past the limit made the beside-write fail as "destination unwritable"
+    (audit, 2026-09-12). The tag is kept whole; the basename is cut."""
+    suffix = ".restored-%s" % tag
+    parent, base = os.path.split(destination)
+    room = NAME_MAX - len(suffix.encode("utf-8"))
+    encoded = base.encode("utf-8")
+    if len(encoded) > room:
+        base = encoded[:room].decode("utf-8", "ignore")
+    return os.path.join(parent, base + suffix)
+
+
 def _write(path, payload):
     """Write `payload` to `path` through a temp file in the same directory.
 
@@ -1040,16 +1057,21 @@ def _write(path, payload):
     0644 less the umask.
     """
     parent = os.path.dirname(path) or "."
-    fd, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".dhu-backup-restore.",
-                                dir=parent)
+    # A short fixed prefix, not the basename: a 255-byte basename plus a suffix
+    # is longer than NAME_MAX, and the daemon can capture names that long.
+    fd, temp = tempfile.mkstemp(prefix=".dhu-backup-restore.", dir=parent)
+    closed = False
     try:
         umask = os.umask(0)
         os.umask(umask)
         os.fchmod(fd, 0o644 & ~umask)
         with os.fdopen(fd, "wb") as handle:
+            closed = True  # fdopen owns the descriptor from here
             handle.write(payload)
         os.replace(temp, path)
     except BaseException:
+        if not closed:
+            os.close(fd)
         try:
             os.unlink(temp)
         except OSError:

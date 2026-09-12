@@ -2201,6 +2201,19 @@ class DisplayPathTests(unittest.TestCase):
         self.assertIn("\n", command)          # the shell-quoted command is verbatim
         self.assertIn("\x1b", command)
 
+    def test_every_format_and_separator_character_is_escaped_by_category(self):
+        """The audit of 2026-09-12: U+202E (right-to-left override), U+061C,
+        U+180E, the isolates, soft hyphen, word joiner and the tag block all
+        passed an explicit list. Unicode category Cf/Cc/Cs/Zl/Zp closes them."""
+        module = dhu_backup_announce
+        for char in ("\u202e", "\u2066", "\u061c", "\u180e", "\u00ad", "\u2060",
+                     "\U000e0041", "\u2028", "\u2029", "\u200b", "\x1b"):
+            rendered = module.display_path("a" + char + "b")
+            self.assertNotIn(char, rendered, repr(char))
+            self.assertTrue(rendered.startswith("a\\"), repr(rendered))
+        self.assertEqual(module.display_path("caf\u00e9/notes.md"), "caf\u00e9/notes.md")
+
+
 
 class WriteTempFileTests(FixtureCase):
     """C1-F9: the restore's temp file follows no planted symlink."""
@@ -2239,7 +2252,7 @@ class WriteTempFileTests(FixtureCase):
         destination = os.path.join(self.directory, "file.txt")
         # `mkstemp` names the file <prefix><candidate>; make every candidate
         # the same word and plant a link at exactly that name.
-        planted = destination + ".dhu-backup-restore.planted"
+        planted = os.path.join(self.directory, ".dhu-backup-restore.planted")
         os.symlink(self.victim, planted)
         original = self.helper.tempfile._get_candidate_names
         original_max = self.helper.tempfile.TMP_MAX
@@ -2272,3 +2285,22 @@ class WriteTempFileTests(FixtureCase):
         with self.assertRaises(OSError):
             self.helper._write(os.path.join(self.directory, "file.txt"), b"x")
         self.assertEqual(os.listdir(self.directory), [])
+
+
+    def test_a_255_byte_basename_can_be_restored_and_written_beside(self):
+        """The audit of 2026-09-12: the temp name carried the basename plus a
+        suffix and overflowed NAME_MAX from 228 characters; the beside-name
+        from 186. The daemon captures names up to 255 bytes."""
+        helper = self.helper
+        base = "n" * 255
+        destination = os.path.join(self.directory, base)
+        helper._write(destination, b"long name\n")
+        with open(destination, "rb") as handle:
+            self.assertEqual(handle.read(), b"long name\n")
+        self.assertEqual([n for n in os.listdir(self.directory) if "dhu-backup-restore" in n], [])
+        beside = helper._beside_name(destination, "1789178405650534091-d7fd1ab990b4")
+        self.assertLessEqual(len(os.path.basename(beside).encode("utf-8")), 255)
+        self.assertTrue(beside.endswith(".restored-1789178405650534091-d7fd1ab990b4"))
+        self.assertEqual(os.path.dirname(beside), self.directory)
+        short = helper._beside_name(os.path.join(self.directory, "notes.md"), "1-ab")
+        self.assertEqual(os.path.basename(short), "notes.md.restored-1-ab")

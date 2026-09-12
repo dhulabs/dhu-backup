@@ -1501,7 +1501,7 @@ def health_verdict(state, now_epoch, error_kind=None, error_detail=None):
     raw = state.get("last_scan_epoch")
     try:
         last = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return Health("unreadable-heartbeat", "last_scan_epoch is %r, not a number" % (raw,))
     if not 0 <= last <= MAX_HEARTBEAT_EPOCH:
         return Health("unreadable-heartbeat",

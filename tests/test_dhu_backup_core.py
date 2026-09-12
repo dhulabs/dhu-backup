@@ -2314,3 +2314,12 @@ class HeartbeatEpochBoundsTests(unittest.TestCase):
             "unreadable-heartbeat")
         self.assertEqual(dhu_backup_core.health_verdict(
             {"state": "ok", "last_scan_epoch": NOW + 999999}, NOW).verdict, "ok")
+
+
+    def test_an_infinite_epoch_is_unreadable_not_a_traceback(self):
+        # json.dumps(float("inf")) round-trips as Infinity, which int() refuses
+        # with OverflowError rather than ValueError (audit, 2026-09-12).
+        for raw in (float("inf"), float("-inf")):
+            verdict = health_verdict({"state": "ok", "last_scan_epoch": raw}, 10 ** 9)
+            self.assertEqual(verdict.verdict if hasattr(verdict, "verdict") else verdict[0],
+                             "unreadable-heartbeat")
