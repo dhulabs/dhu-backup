@@ -18,9 +18,9 @@ class DhuBackup < Formula
   url "https://github.com/dhulabs/dhu-backup/archive/refs/tags/v0.3.0.tar.gz"
   # The sha256 of the published v0.3.0 tarball, computed twice from
   #   curl -sL https://github.com/dhulabs/dhu-backup/archive/refs/tags/v0.3.0.tar.gz | shasum -a 256
-  # on 2026-09-12 after the release was cut. A wrong checksum here fails the
+  # on 2026-09-12 after the release was cut and again after the author-identity rewrite of the same day. A wrong checksum here fails the
   # install loudly; re-run that command against any new tag before bumping.
-  sha256 "45c234006aaa2bf3b8d01a776011b94f701c04fc51a78366f9b0ff67c81cb6b3"
+  sha256 "4f8f07b9f43f5ee28ba9f0966d3347bc0e8f1565b458c52b7ab335e2380f9a47"
   license "Apache-2.0"
 
   # No `depends_on "python"`. The daemon and the helpers run under the SYSTEM
