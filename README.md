@@ -70,6 +70,12 @@ source and destination:
 bash src/install.sh --dry-run --watch repo=/Users/you/Projects/my-repo
 ```
 
+**On macOS, keep watch roots out of `~/Desktop`, `~/Documents` and
+`~/Downloads`** unless you grant the daemon Full Disk Access: those locations
+are protected by the OS even from root, and a root daemon without the grant
+gets `EPERM` there and reports the root as refused. See
+[`docs/LIMITS.md`](docs/LIMITS.md) §1a.
+
 **Size up your watch roots first.** The first scan walks every watched root
 once, and a large directory inside one costs real time: a model cache or a
 Python virtualenv can hold tens of thousands of files that are individually
@@ -344,7 +350,7 @@ the full page.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-652 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
+712 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. CI
 runs the same suite on `macos-latest` and `ubuntu-latest`, which is the standing
 proof that it passes on a clean machine with nothing from a developer's own.
 

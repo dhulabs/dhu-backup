@@ -676,7 +676,15 @@ Nothing is silently clobbered: if the target exists with different content,
 non-zero. `--overwrite` opts into the in-place write.
 
 Every invocation prints the daemon's health first, so "no versions" is never
-mistaken for "capture has been stopped for two days".
+mistaken for "capture has been stopped for two days". The banner's verdict is
+`health_verdict`'s and its words are `health_sentence`'s — the same line
+`status` prints — so every command says the same thing about the same
+heartbeat; a heartbeat this version cannot interpret is `!! HEARTBEAT
+UNREADABLE` on `ls` exactly as it is on `status`, never a traceback or silence.
+
+An `--into` that cannot be written — a regular file, a read-only volume, a
+directory you may not write — is `ERROR could not write <dest>: <reason>` and
+exit 2. The store was readable; the message says which side failed.
 
 **Recovering a vaulted (credential-class) file** is the owner's to do, deliberately,
 with sudo — and it is a READ, never a `restore`:
@@ -847,7 +855,7 @@ Six values, and they are the reason this is worth having rather than a `test -e`
 | `held` | the store holds versions of this exact path: keys, capture times, sizes, hashes, store paths, and the `cat`/`restore`/`log` commands | 0 |
 | `held-directory` | the path is a directory prefix under which the store holds N paths — the incident's shape — with the `restore-dir` command | 0 |
 | `vaulted` | the path is credential-class, so it can only be in the root-only vault | 1 |
-| `not-held` | inside a watch root, the store WAS read, and it holds no version of this path | 1 |
+| `not-held` | inside a watch root, the store WAS read, and it holds no version of this path; a path the filesystem cannot name (a component past `NAME_MAX`, a symlink loop) is this too, with `reason` set to `unnameable-path: …`, because a path the daemon could not have written cannot have been captured | 1 |
 | `outside-watch-roots` | no watch root contains this path, so it was never protected; the watch roots are named | 1 |
 | `store-unavailable` | the store, the root manifests or the heartbeat could not be read; the reason is carried verbatim | 2 |
 
@@ -910,11 +918,20 @@ not-held file costs two `stat`s and stops. The bounded walk happens only when
 the path names a directory the store actually holds, and it stops at 10,000
 paths and reports "at least N" rather than walking forever.
 
+A HELD result pays a little more: one `listdir` of each matching version
+directory and of each directory component, to learn the spelling the store
+actually holds. On APFS the `lstat` above succeeds for `readme.md` against a
+version of `README.md`, and `cat`/`restore`/`log` select by exact bytes — so
+the result reports the store's spelling in `relpath` and `origin`, builds the
+commands from it, and says so in `reason`. The path as given stays in `path`.
+
 ### Why it never raises
 
 A recovery hint that throws inside an error handler turns a recoverable ENOENT
 into a crash in the tool that was trying to help. Every `OSError` becomes a
-`store-unavailable` result carrying the errno text, and the outermost handler
+`store-unavailable` result carrying the errno text — except the ones that ARE
+answers: `ENOENT`/`ENOTDIR` (nothing here) and `ENAMETOOLONG`/`ELOOP` (a path
+the filesystem cannot name, reported `not-held` with the reason) — and the outermost handler
 catches everything else for the same reason — a contract that holds only for the
 exceptions we thought of is not a contract. It is asserted directly against
 hostile inputs (a NUL byte, an empty string, a relative path, `..`, `None`,
@@ -936,9 +953,27 @@ Stdlib-only JSON-RPC 2.0 over newline-delimited stdio, MCP `2025-06-18`, seven
 tools: `dhu_backup_status`, `dhu_backup_missing`, `dhu_backup_ls`,
 `dhu_backup_log`, `dhu_backup_cat`, `dhu_backup_restore`,
 `dhu_backup_restore_dir`. Each returns a JSON text block
-plus `structuredContent`, and every result carries the daemon's health verdict.
+plus `structuredContent`, and every result carries the daemon's health verdict —
+including the catch-all for a tool that throws, which reports `kind:
+internal-error` rather than blaming the store.
 `dhu_backup_cat` returns UTF-8 when the content decodes and base64 otherwise,
 with an `encoding` field saying which.
+
+Arguments are checked against their declared types and a wrong type is a
+`-32602` error, never a coercion: `overwrite` in particular must be a JSON
+boolean, because `bool("false")` is true and that flag gates the one
+destructive write. `dhu_backup_ls` returns at most 500 matches — a result is
+one JSON frame handed to a model, and an unfiltered call against a real store
+was 35 MB — with `match_count`, `truncated` and a `hint` to narrow the
+substring when the cap binds. The two writers carry a `kind` beside
+`exit_code`: `restored`, `unchanged`, `beside`, `no-match`, `ambiguous`,
+`vaulted`, `no-version`, `bad-asof`, `refused-target`, `store-unavailable` or
+`destination-unwritable`; only the last two and `refused` are `isError`.
+
+At the transport, a frame that is not valid UTF-8, or is nested too deeply to
+parse, is a `-32700` on that frame and the session continues. A message with
+no `id` member is a notification and is not answered, whatever its method;
+an `id` that is present and null is a request and is answered with null.
 
 It adds **no privilege and no new write path**: it is the same unprivileged
 helper behind a different transport, reading the world-readable store as the
@@ -1004,6 +1039,18 @@ looked up. Candidates are de-duplicated, capped at eight, and absolutised with
 `normpath` — never `realpath`, for the same C7/C8 reason as the rest of the
 announce path.
 
+**What it echoes is rendered, not repeated.** The path in a Bash failure is
+text from the OUTPUT of whatever the agent just ran, and the hook speaks with
+the product's voice. In the prose lines every path-derived value goes through
+`display_path`: control characters, `DEL`, the Unicode line separators, the
+zero-width characters and the byte-order mark become their escapes (`\x0a`,
+`\x1b`, `\u200b`) rather than vanishing, and anything past 512 characters
+is replaced by a count. A newline in a path can no longer forge a second
+`dhu-backup:` line, and an escape sequence no longer reaches a terminal. The
+command lines keep the exact path for the shell, but a path carrying a control
+character is quoted in bash's `$'...'` form with each such character as an
+escape, so a command line is always one line too.
+
 Live, against the real install, on a file that was deleted a session earlier. The
 run happened on the author's own machine on 2026-09-02 and is recorded in
 [`docs/PROOFS.md`](../docs/PROOFS.md); only the home-directory path is
@@ -1067,7 +1114,7 @@ record. The daemon's own capture log is the authoritative one.
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-652 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
+712 tests, green on macOS under Python 3.9 and on Ubuntu under Python 3.14. The suite is
 platform-aware rather than platform-specific: it asserts THIS platform's install
 surface, and asserts the other platform's through `--dry-run --platform`, which
 is what that flag exists for. Three tests that assert the scripts refuse without

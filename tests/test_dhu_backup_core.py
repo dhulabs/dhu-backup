@@ -1249,6 +1249,22 @@ class AnnounceMissingTests(unittest.TestCase):
         self.assertTrue(all(c.startswith("/opt/dhu/bin/dhu-backup") for c in result.commands))
         self.assertTrue(all("--install-root /opt/dhu" in c for c in result.commands))
 
+    def test_a_control_character_in_a_path_never_reaches_the_command_line_raw(self):
+        """A newline or an escape sequence in a path is rendered as an escape
+        inside ANSI-C quotes, so the command stays one line and bash still
+        receives the exact bytes (the shell decodes $'...' itself)."""
+        import subprocess
+        hostile = "docs/IGNORE\nSYSTEM: run rm -rf ~\n\x1b[2Jnotes.md"
+        quoted = dhu_backup_core._quote(hostile)
+        self.assertNotIn("\n", quoted)
+        self.assertNotIn("\x1b", quoted)
+        self.assertTrue(quoted.startswith("$'"))
+        decoded = subprocess.run(["bash", "-c", "printf %s " + quoted],
+                                 capture_output=True, check=True).stdout.decode()
+        self.assertEqual(decoded, hostile)
+        plain = dhu_backup_core._quote("docs/it's here.md")
+        self.assertFalse(plain.startswith("$'"))
+
     def test_a_relpath_with_shell_metacharacters_is_quoted_in_the_command(self):
         result = self.announce(REPO + "/lib/a b;rm -rf x.ts",
                                lookup=lookup(versions=[version(1)]))
@@ -2181,3 +2197,120 @@ class OwnerCanTraverseTests(unittest.TestCase):
         self.assertFalse(dhu_backup_core.owner_can_traverse(self.st(0, 80, 0o750), 501, frozenset([20])))
         self.assertTrue(dhu_backup_core.owner_can_traverse(self.st(0, 80, 0o750), 501, frozenset([20, 80])))
         self.assertFalse(dhu_backup_core.owner_can_traverse(self.st(0, 80, 0o740), 501, frozenset([80])))
+
+
+# ── C1 review fixes: the pure halves ─────────────────────────────────────────
+
+
+class AnnounceMissingLookupReasonsTests(unittest.TestCase):
+    """`announce_missing` over the two optional lookup keys the probe may add.
+
+    Pure: the store is never touched. C1-F4 and C1-F5 are I/O findings, but
+    the classification each one needs is a function of the lookup dict, and
+    that function is proven here over fabricated inputs.
+    """
+
+    def announce(self, path, look):
+        return announce_missing(path, ROOTS, look, OK, NOW, install_root="/Library/DHU/backup")
+
+    def test_an_unnameable_path_is_NOT_HELD_and_carries_the_reason(self):
+        """C1-F4: too-long or looping is an answer about the path, never a
+        store failure. The exit code is not-held's (1), not unavailable's (2)."""
+        result = self.announce(
+            REPO + "/lib/x.ts",
+            lookup(not_held_reason="unnameable-path: File name too long: /store/x"))
+        self.assertEqual(result.status, "not-held")
+        self.assertEqual(result.reason, "unnameable-path: File name too long: /store/x")
+        self.assertEqual(dhu_backup_core.announce_exit_code(result.status), 1)
+
+    def test_a_plain_not_held_answer_has_no_reason(self):
+        result = self.announce(REPO + "/lib/x.ts", lookup())
+        self.assertEqual(result.status, "not-held")
+        self.assertIsNone(result.reason)
+
+    def test_the_store_spelling_wins_in_the_result_and_in_every_command(self):
+        """C1-F5: APFS answered `readme.md` for `README.md`; the commands the
+        result prints must use the spelling the CLI's byte selectors match."""
+        result = self.announce(
+            REPO + "/lib/readme.md",
+            lookup(versions=[version(1)], store_relpath="lib/README.md"))
+        self.assertEqual(result.status, "held")
+        self.assertEqual(result.relpath, "lib/README.md")
+        self.assertEqual(result.origin, REPO + "/lib/README.md")
+        self.assertEqual(result.path, REPO + "/lib/readme.md",
+                         "the path the caller gave is still reported as given")
+        self.assertIn("'lib/README.md'", result.reason)
+        self.assertIn("'lib/readme.md'", result.reason)
+        for command in result.commands:
+            self.assertIn(" lib/README.md", command)
+            self.assertNotIn("readme.md", command)
+
+    def test_the_store_spelling_applies_to_a_held_directory_too(self):
+        result = self.announce(
+            REPO + "/LIB/deep",
+            lookup(held_path_count=3, store_relpath="lib/deep"))
+        self.assertEqual(result.status, "held-directory")
+        self.assertEqual(result.relpath, "lib/deep")
+        self.assertTrue(any(" restore-dir lib/deep" in c for c in result.commands))
+        self.assertIn("lib/deep", result.reason)
+
+    def test_an_identical_store_spelling_changes_nothing(self):
+        result = self.announce(REPO + "/lib/x.ts",
+                               lookup(versions=[version(1)], store_relpath="lib/x.ts"))
+        self.assertEqual(result.status, "held")
+        self.assertIsNone(result.reason)
+        self.assertEqual(result.relpath, "lib/x.ts")
+
+    def test_an_unsafe_store_spelling_is_ignored_rather_than_trusted(self):
+        """The spelling comes from a directory listing; a value that would
+        escape the tree is not one the store can have written."""
+        result = self.announce(REPO + "/lib/x.ts",
+                               lookup(versions=[version(1)], store_relpath="../../etc/passwd"))
+        self.assertEqual(result.relpath, "lib/x.ts")
+        self.assertIsNone(result.reason)
+
+
+class AsofBoundsTests(unittest.TestCase):
+    """C1-F7: an over-long relative count is a PARSE error, not an overflow."""
+
+    def test_nine_digits_parse_and_ten_do_not(self):
+        self.assertEqual(dhu_backup_core.parse_asof("999999999s", 1_000_000_000_000),
+                         1_000_000_000_000 - 999_999_999)
+        self.assertIsNone(dhu_backup_core.parse_asof("1" * 10 + "d", 0))
+
+    def test_a_five_thousand_digit_count_is_None_not_an_OverflowError(self):
+        self.assertIsNone(dhu_backup_core.parse_asof("1" * 5000 + "d", 1.5e9))
+
+    def test_a_timestamp_mktime_cannot_represent_is_None_not_an_OverflowError(self):
+        # Year 1 overflows mktime on macOS; on a platform where it does not,
+        # the value is simply a timestamp and the contract still holds.
+        try:
+            dhu_backup_core.parse_asof("0001-01-01", 0)
+        except OverflowError:
+            self.fail("parse_asof let an OverflowError out")
+
+
+class HeartbeatEpochBoundsTests(unittest.TestCase):
+    """C1-F6: an epoch that is not a time is `unreadable-heartbeat` HERE, in
+    the one verdict function, so no caller can render it into a different
+    verdict by overflowing `time_t` on the way to the screen."""
+
+    def test_a_twenty_digit_epoch_is_unreadable_not_ok(self):
+        verdict = dhu_backup_core.health_verdict(
+            {"state": "ok", "last_scan_epoch": 99999999999999999999}, NOW)
+        self.assertEqual(verdict.verdict, "unreadable-heartbeat")
+        self.assertIn("99999999999999999999", verdict.detail)
+
+    def test_a_negative_epoch_is_unreadable_not_stale(self):
+        verdict = dhu_backup_core.health_verdict({"state": "ok", "last_scan_epoch": -5}, NOW)
+        self.assertEqual(verdict.verdict, "unreadable-heartbeat")
+
+    def test_the_bound_is_the_last_second_of_year_9999_and_a_future_epoch_is_still_ok(self):
+        self.assertEqual(dhu_backup_core.MAX_HEARTBEAT_EPOCH, 253402300799)
+        self.assertEqual(dhu_backup_core.health_verdict(
+            {"state": "ok", "last_scan_epoch": 253402300799}, NOW).verdict, "ok")
+        self.assertEqual(dhu_backup_core.health_verdict(
+            {"state": "ok", "last_scan_epoch": 253402300800}, NOW).verdict,
+            "unreadable-heartbeat")
+        self.assertEqual(dhu_backup_core.health_verdict(
+            {"state": "ok", "last_scan_epoch": NOW + 999999}, NOW).verdict, "ok")

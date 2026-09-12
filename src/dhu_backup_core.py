@@ -995,7 +995,13 @@ def resolve_asof(versions, at_epoch_ns):
     return max(eligible, key=lambda v: v["epoch_ns"])
 
 
-RELATIVE_ASOF = re.compile(r"^(\d+)([smhd])$")
+#: A relative age is at most nine digits. 999,999,999 days is 2.7 million years,
+#: which is every age anyone will type; a count with no bound turned a
+#: 5,000-digit `--asof` into an `OverflowError` out of the float arithmetic
+#: below, which the CLI printed as a traceback and the MCP server reported as
+#: `store-unavailable` — a store that was fine. An over-long count is a PARSE
+#: error, and now it is one.
+RELATIVE_ASOF = re.compile(r"^(\d{1,9})([smhd])$")
 _RELATIVE_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -1003,7 +1009,9 @@ def parse_asof(text, now_epoch_seconds):
     """Seconds-since-epoch for an --asof argument, or None if unparseable.
 
     Accepts an ISO timestamp (`2026-09-01T14:30:00`) or a relative age
-    (`20m`, `2h`, `3d`) meaning "that long ago".
+    (`20m`, `2h`, `3d`) meaning "that long ago". Never raises on a string:
+    a timestamp the platform's `mktime` cannot represent (year 1, say) is
+    unparseable, not a crash.
     """
     if not isinstance(text, str) or not text:
         return None
@@ -1013,7 +1021,7 @@ def parse_asof(text, now_epoch_seconds):
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
             return time.mktime(time.strptime(text.strip(), fmt))
-        except ValueError:
+        except (ValueError, OverflowError):
             continue
     return None
 
@@ -1233,6 +1241,15 @@ def interpreter_verdict(path, is_symlink, link_uid, target, target_uid):
     return InterpreterVerdict(True, "%s is a root-owned regular interpreter" % path)
 
 STALE_SECONDS = 300
+
+#: The largest `last_scan_epoch` a heartbeat can carry and still be a time:
+#: 9999-12-31T23:59:59 UTC. The daemon writes `int(time.time())`, so a value
+#: past this — or below zero — is not a capture time, it is a heartbeat this
+#: version cannot interpret. Without the bound a 20-digit epoch was `ok` here
+#: (its age is negative) while `status` reported `unreadable-heartbeat`,
+#: because rendering it overflowed `time_t` and fell into the catch-all: two
+#: verdicts for one heartbeat, from the same function's arithmetic.
+MAX_HEARTBEAT_EPOCH = 253402300799
 
 #: Every health verdict `health_verdict` can return. There is no eighth value
 #: and no `None`: "we do not know" is spelled `unreadable-heartbeat`, which is
@@ -1486,6 +1503,10 @@ def health_verdict(state, now_epoch, error_kind=None, error_detail=None):
         last = int(raw)
     except (TypeError, ValueError):
         return Health("unreadable-heartbeat", "last_scan_epoch is %r, not a number" % (raw,))
+    if not 0 <= last <= MAX_HEARTBEAT_EPOCH:
+        return Health("unreadable-heartbeat",
+                      "last_scan_epoch is %r, not a timestamp this version can interpret"
+                      % (raw,))
     age = int(now_epoch) - last
     if age > STALE_SECONDS:
         return Health("stale", "the last capture was %ds ago" % age)
@@ -1568,7 +1589,23 @@ def _quote(text):
     Stdlib either way (review H3 forbids anything else).
     """
     import shlex
-    return shlex.quote(text)
+    if not any(ord(c) < 0x20 or ord(c) == 0x7f for c in text):
+        return shlex.quote(text)
+    # A control character inside ordinary single quotes is shell-correct but
+    # still RAW in the rendered line: a newline in a path put a second line
+    # into the model's context, starting with whatever followed it
+    # (independent review, 2026-09-11). ANSI-C quoting keeps the command exact
+    # and renders every control character as an escape on one line.
+    out = []
+    for c in text:
+        o = ord(c)
+        if c in ("\\", "'"):
+            out.append("\\" + c)
+        elif o < 0x20 or o == 0x7f:
+            out.append("\\x%02x" % o)
+        else:
+            out.append(c)
+    return "$'" + "".join(out) + "'"
 
 
 def recovery_commands(status, install_root, located, relpath_for_command=None):
@@ -1692,6 +1729,16 @@ def announce_missing(abs_path, roots, lookup, health, now_epoch,
                  `probed`       whether a probe actually ran
                  `versions`     `[{key, epoch_ns, sha, size, store_path, ...}]`
                  `held_path_count`, `held_path_count_capped`, `versions_capped`
+                 `not_held_reason`  (optional) WHY a not-held answer was given
+                                without a full probe — a path the filesystem
+                                cannot name (too long, a symlink loop) cannot
+                                have been captured, and is reported not-held
+                                with this reason rather than as a store failure
+                 `store_relpath`    (optional) the relpath AS THE STORE SPELLS
+                                IT when the probe matched through a
+                                case-insensitive filesystem; the commands are
+                                built from this spelling, because the CLI's
+                                selectors match bytes and would otherwise fail
     `health` — a `Health` (or a dict with `verdict`/`detail`), carried into
                EVERY result. "Not held" while the daemon has been dead for a day
                is a different fact from "not held" under a healthy daemon, and
@@ -1756,11 +1803,27 @@ def announce_missing(abs_path, roots, lookup, health, now_epoch,
                             reason="no store lookup was performed for %r" % (located.relpath,),
                             **dict(base, **placed))
 
+    # The store's own spelling of the path, when the probe matched through a
+    # case-insensitive filesystem (APFS answers `readme.md` for `README.md`).
+    # The CLI's `cat`/`restore`/`log` select by exact substring on the relpath
+    # the daemon recorded, so a command built from the caller's spelling would
+    # be a command that fails. The result names the store's spelling, the
+    # commands use it, and `reason` says what happened.
+    spelling_note = None
+    store_relpath = lookup.get("store_relpath")
+    if (isinstance(store_relpath, str) and store_relpath and located.relpath
+            and store_relpath != located.relpath and is_safe_relpath(store_relpath)):
+        spelling_note = ("the store spells this path %r; the path given was %r"
+                         % (store_relpath, located.relpath))
+        located = located._replace(relpath=store_relpath)
+        placed = dict(placed, relpath=store_relpath,
+                      origin=os.path.join(located.watch_root, store_relpath))
+
     versions = tuple(lookup.get("versions") or ())
     if versions:
         newest = max(versions, key=lambda v: (v["epoch_ns"], v["key"]))
         return Announcement(
-            status="held", versions=versions, newest=newest,
+            status="held", versions=versions, newest=newest, reason=spelling_note,
             versions_capped=bool(lookup.get("versions_capped")),
             commands=recovery_commands("held", install_root, located),
             **dict(base, **placed))
@@ -1768,10 +1831,16 @@ def announce_missing(abs_path, roots, lookup, health, now_epoch,
     count = int(lookup.get("held_path_count") or 0)
     if count > 0:
         return Announcement(
-            status="held-directory", held_path_count=count,
+            status="held-directory", held_path_count=count, reason=spelling_note,
             held_path_count_capped=bool(lookup.get("held_path_count_capped")),
             commands=recovery_commands("held-directory", install_root, located,
                                        relpath_for_command=located.relpath or "."),
             **dict(base, **placed))
 
-    return Announcement(status="not-held", **dict(base, **placed))
+    # `not_held_reason` is carried, never required: a plain "looked, nothing
+    # there" has no reason to give, and one that names a path the filesystem
+    # cannot represent says so in the field an agent can read.
+    not_held_reason = lookup.get("not_held_reason")
+    return Announcement(status="not-held",
+                        reason=str(not_held_reason) if not_held_reason else None,
+                        **dict(base, **placed))

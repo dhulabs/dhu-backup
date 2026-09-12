@@ -105,7 +105,10 @@ class Args(object):
         self.asof = kwargs.get("asof")
         self.version = kwargs.get("version")
         self.into = kwargs.get("into")
-        self.overwrite = bool(kwargs.get("overwrite"))
+        # A JSON boolean or absent, and nothing else: `bool("false")` is True,
+        # and this flag gates the one destructive write on the whole surface.
+        # The type check lives in `_optional_bool`; this bag only stores it.
+        self.overwrite = kwargs.get("overwrite") is True
 
 
 def _health(install_root):
@@ -137,6 +140,24 @@ def _optional(arguments, name):
     return value
 
 
+def _optional_bool(arguments, name):
+    """A JSON boolean, absent, or a -32602 — never a truthy string.
+
+    `overwrite` gates the only destructive path here. `bool(value)` accepted
+    the strings "false" and "no" as True, so a client that stringifies its
+    booleans — LLM tool callers do — replaced an agent's intentional edit with
+    the stored version while believing it had said no. The schema declares
+    `boolean`; this is what makes the declaration true.
+    """
+    value = arguments.get(name)
+    if value is None:
+        return None
+    if value is not True and value is not False:
+        raise ValueError("%r must be a JSON boolean (true or false), not %s"
+                         % (name, type(value).__name__))
+    return value
+
+
 # ── the seven tools ───────────────────────────────────────────────────────────
 
 
@@ -161,19 +182,35 @@ def tool_status(install_root, arguments):
     return payload, payload["exit_code"] == 2
 
 
+#: Matches one `dhu_backup_ls` result carries. The CLI streams lines and can
+#: list a whole store; an MCP result is ONE JSON frame handed to a model, and
+#: an unfiltered call against a real store produced a 35 MB frame of 34,649
+#: matches. Past this the result says `truncated: true`, carries the full
+#: `match_count`, and tells the caller to narrow the substring — the same rule
+#: `_select_one` applies to its candidate list.
+LS_MAX_MATCHES = 500
+
+
 def tool_ls(install_root, arguments):
     args = Args(install_root, substring=_optional(arguments, "substring"),
                 root_id=_optional(arguments, "root_id"))
     entries, error = helper.load_entries(install_root)
     health = _health(install_root)
     if error:
-        return {"error": error, "health": health, "matches": [], "store_paths": 0}, True
+        return {"error": error, "health": health, "matches": [], "store_paths": 0,
+                "match_count": 0, "truncated": False, "hint": None}, True
     matches = helper.select_entries(entries, args.substring, args.root_id)
+    truncated = len(matches) > LS_MAX_MATCHES
     return {
         "error": None,
         "health": health,
         "store_paths": len(entries),
         "vault_present": helper.vault_is_present(install_root),
+        "match_count": len(matches),
+        "truncated": truncated,
+        "hint": ("%d paths match; only the first %d are listed. Narrow the "
+                 "substring (or pass root_id) to see the rest."
+                 % (len(matches), LS_MAX_MATCHES)) if truncated else None,
         "matches": [
             {"relpath": e["relpath"], "root_id": e["root_id"], "slug": e["slug"],
              "watch_root": e["watch_root"],
@@ -181,7 +218,7 @@ def tool_ls(install_root, arguments):
              "versions": len(e["versions"]),
              "newest_epoch_ns": e["versions"][-1]["epoch_ns"],
              "newest_iso": helper._iso(e["versions"][-1]["epoch_ns"])}
-            for e in matches
+            for e in matches[:LS_MAX_MATCHES]
         ],
     }, False
 
@@ -263,11 +300,22 @@ def tool_cat(install_root, arguments):
 
 
 def _run_capturing(function, args):
-    """Run a helper command with its printed lines captured. Returns (code, lines)."""
+    """Run a helper outcome function with its printed lines captured.
+
+    Returns `((code, kind), lines)` — whatever the function returned, plus the
+    lines it printed.
+    """
     captured = io.StringIO()
     with redirect_stdout(captured):
-        code = function(args)
-    return code, captured.getvalue().splitlines()
+        outcome = function(args)
+    return outcome, captured.getvalue().splitlines()
+
+
+#: Restore kinds that mean the tool could NOT do what it was asked because of
+#: the environment — the store could not be read, or the destination could not
+#: be written. Those are `isError: true`. "Written beside a differing file",
+#: "no version at that time" and "no such path" are ANSWERS, and stay results.
+_RESTORE_ERROR_KINDS = ("store-unavailable", "destination-unwritable", "refused")
 
 
 def _restore_refusal(install_root):
@@ -294,11 +342,12 @@ def tool_restore(install_root, arguments):
         return refusal, True
     args = Args(install_root, path=_require(arguments, "path"),
                 asof=_optional(arguments, "asof"), version=_optional(arguments, "version"),
-                into=_optional(arguments, "into"), overwrite=arguments.get("overwrite"),
+                into=_optional(arguments, "into"),
+                overwrite=_optional_bool(arguments, "overwrite"),
                 root_id=_optional(arguments, "root_id"))
-    code, lines = _run_capturing(helper.command_restore, args)
-    return {"health": _health(install_root), "exit_code": code, "lines": lines,
-            "text": "\n".join(lines)}, False
+    (code, kind), lines = _run_capturing(helper.restore_outcome, args)
+    return {"health": _health(install_root), "exit_code": code, "kind": kind,
+            "lines": lines, "text": "\n".join(lines)}, kind in _RESTORE_ERROR_KINDS
 
 
 def tool_restore_dir(install_root, arguments):
@@ -307,10 +356,11 @@ def tool_restore_dir(install_root, arguments):
         return refusal, True
     args = Args(install_root, directory=_require(arguments, "directory"),
                 asof=_optional(arguments, "asof"), into=_optional(arguments, "into"),
+                overwrite=_optional_bool(arguments, "overwrite"),
                 root_id=_optional(arguments, "root_id"))
-    code, lines = _run_capturing(helper.command_restore_dir, args)
-    return {"health": _health(install_root), "exit_code": code, "lines": lines,
-            "text": "\n".join(lines)}, False
+    (code, kind), lines = _run_capturing(helper.restore_dir_outcome, args)
+    return {"health": _health(install_root), "exit_code": code, "kind": kind,
+            "lines": lines, "text": "\n".join(lines)}, kind in _RESTORE_ERROR_KINDS
 
 
 _PATH = {"type": "string", "description": "a path or path substring as the store holds it"}
@@ -413,7 +463,10 @@ TOOLS = [
         "title": 'List protected paths that have versions',
         "annotations": READ_ONLY,
         "description": "Which protected paths have versions in the mirror. Optional "
-                       "substring filter on the path relative to its watch root.",
+                       "substring filter on the path relative to its watch root. At "
+                       "most %d matches are returned; `match_count` is the true "
+                       "total and `truncated: true` with a `hint` says to narrow the "
+                       "substring when it binds." % LS_MAX_MATCHES,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -487,6 +540,7 @@ TOOLS = [
                               "description": "the directory, relative to its watch root"},
                 "asof": _ASOF,
                 "into": {"type": "string", "description": "restore under this base directory"},
+                "overwrite": {"type": "boolean", "description": "replace differing files"},
                 "root_id": {"type": "string", "description": "limit to one watch-root id"},
             },
             "required": ["directory"],
@@ -517,9 +571,21 @@ def _error(request_id, code, message):
 
 
 def handle(message, install_root):
-    """One request in, one response out — or None for a notification."""
+    """One request in, one response out — or None for a notification.
+
+    JSON-RPC 2.0: a request WITHOUT an `id` member is a notification and MUST
+    NOT be answered, whatever its method and even when it is malformed. One
+    whose `id` is present and null is a request, and is answered with that
+    id. This used to answer every id-less message with `"id": null`.
+    """
     if not isinstance(message, dict):
         return _error(None, -32600, "request must be a JSON object")
+    is_notification = "id" not in message
+    response = _handle_request(message, install_root)
+    return None if is_notification else response
+
+
+def _handle_request(message, install_root):
     request_id = message.get("id")
     method = message.get("method")
     if not isinstance(method, str):
@@ -550,6 +616,12 @@ def handle(message, install_root):
 
 def _call_tool(request_id, params, install_root):
     name = params.get("name")
+    if not isinstance(name, str):
+        # A list or an object here reached `DISPATCH.get` and died unhashable,
+        # taking the transport with it. A tool name is a string or it is a
+        # bad parameter.
+        return _error(request_id, -32602, "tool name must be a string, not %s"
+                      % type(name).__name__)
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         return _error(request_id, -32602, "arguments must be an object")
@@ -562,9 +634,13 @@ def _call_tool(request_id, params, install_root):
         return _error(request_id, -32602, str(exc))
     except Exception as exc:            # noqa: BLE001
         # A tool that throws must not take the transport down with it: the
-        # caller is usually an error handler already.
+        # caller is usually an error handler already. `kind` is `internal-error`
+        # and not `store-unavailable`: this handler knows nothing about the
+        # store, and naming it sent readers to the wrong side of every failure
+        # that was not the store's. The health field is here too — the
+        # docstring's promise is EVERY result, and this was the one without.
         payload = {"error": "%s: %s" % (type(exc).__name__, exc),
-                   "kind": "store-unavailable"}
+                   "kind": "internal-error", "health": _health(install_root)}
         is_error = True
     return _result(request_id, {
         "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
@@ -585,7 +661,24 @@ def refuse_root():
 
 
 def serve(stdin, stdout, install_root):
-    for line in stdin:
+    """Newline-delimited JSON-RPC until EOF. One bad frame is one -32700.
+
+    Frames are read as BYTES and decoded here, so a frame that is not valid
+    UTF-8 is a parse error on that frame rather than a `UnicodeDecodeError`
+    out of the text stream that ends the session (on macOS / Python 3.9 the
+    text stdin decodes strictly). A frame nested deeply enough to exhaust the
+    parser's recursion is the same parse error: `json.loads` raises
+    `RecursionError`, which is not a `ValueError`.
+    """
+    raw = getattr(stdin, "buffer", stdin)
+    for line in raw:
+        if isinstance(line, bytes):
+            try:
+                line = line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                _emit(stdout, _error(None, -32700, "parse error: frame is not valid UTF-8 "
+                                     "(%s)" % exc.reason))
+                continue
         line = line.strip()
         if not line:
             continue
@@ -593,12 +686,18 @@ def serve(stdin, stdout, install_root):
             message = json.loads(line)
         except ValueError as exc:
             response = _error(None, -32700, "parse error: %s" % exc)
+        except RecursionError:
+            response = _error(None, -32700, "parse error: JSON nested too deeply")
         else:
             response = handle(message, install_root)
         if response is not None:
-            stdout.write(json.dumps(response) + "\n")
-            stdout.flush()
+            _emit(stdout, response)
     return 0
+
+
+def _emit(stdout, response):
+    stdout.write(json.dumps(response) + "\n")
+    stdout.flush()
 
 
 def main(argv=None):

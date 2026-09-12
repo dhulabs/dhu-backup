@@ -40,7 +40,7 @@ Then, from a clone of the tap:
 
 ```bash
 git -C homebrew-tap add Formula/dhu-backup.rb
-git -C homebrew-tap commit -m "dhu-backup 0.2.0"
+git -C homebrew-tap commit -m "dhu-backup 0.3.0"
 git -C homebrew-tap push
 ```
 
@@ -58,11 +58,11 @@ it from the **published** tarball, not from a local archive — the two differ i
 the tag moves:
 
 ```bash
-curl -sL https://github.com/dhulabs/dhu-backup/archive/refs/tags/v0.2.0.tar.gz |
+curl -sL https://github.com/dhulabs/dhu-backup/archive/refs/tags/v0.3.0.tar.gz |
   shasum -a 256
 ```
 
-Paste that hex string over `REPLACE_ME_WITH_THE_SHA256_OF_THE_v0.2.0_TARBALL`.
+Paste that hex string over `REPLACE_ME_WITH_THE_SHA256_OF_THE_v0.3.0_TARBALL`.
 
 ## Updating for a new release
 

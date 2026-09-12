@@ -15,6 +15,18 @@ never wakes early, logs an ERROR at startup naming the platform, and reports
 `"trigger": "poll-only"` in the heartbeat for as long as it runs. Capture still
 works; only latency changes.
 
+## 1a. macOS: a watch root under Desktop, Documents or Downloads needs Full Disk Access
+
+macOS lets no process read `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud
+Drive and a few other locations without the user granting it access, and root
+is not exempt. A LaunchDaemon that has not been granted Full Disk Access in
+System Settings gets `EPERM` there, so a watch root under one of those
+directories is reported as refused or unscannable rather than protected — the
+daemon says so in the heartbeat, but it cannot ask for the grant. `~/Projects`
+and any directory you create at the top of your home are not covered by that
+rule. Not exercised on the author's machines, whose roots are outside those
+locations; stated here so it is not discovered at recovery time.
+
 ## 2. No userspace watcher can promise that nothing is missed
 
 This is the ceiling, and it is worth stating before anything else. A file whose

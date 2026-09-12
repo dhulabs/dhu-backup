@@ -48,6 +48,7 @@ import json
 import os
 import stat
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -200,39 +201,41 @@ def print_health_banner(install_root):
 
     A recovery tool that answers "no versions" without mentioning that capture
     stopped two days ago is answering a different question than the one asked.
+
+    The verdict is `health_verdict`'s and the words are `health_sentence`'s —
+    the SAME path `status`, `--json` and a failed read go through. This used
+    to be a second implementation of the verdict with its own sentences, and
+    it diverged exactly where the shared one had been hardened: a heartbeat
+    that was a list, or whose epoch was not a number, was a traceback here and
+    `unreadable-heartbeat` there; an unknown state label or an absurd epoch
+    was silence here and `unreadable-heartbeat` there. One verdict per
+    heartbeat, whatever command asked.
     """
-    path = os.path.join(install_root, "var", "state.json")
-    try:
-        with open(path) as handle:
-            state = json.load(handle)
-    except IOError:
-        print("!! no heartbeat at %s — DHU Backup may not be installed" % path)
-        return
-    except ValueError:
-        print("!! heartbeat at %s is unreadable — capture status UNKNOWN" % path)
-        return
-    label = state.get("state")
-    age = int(time.time()) - int(state.get("last_scan_epoch") or 0)
-    if label == "degraded":
-        print("!! CAPTURE STOPPED (%s) — nothing has been captured since it degraded."
-              % state.get("degraded_reason", "reason not recorded"))
-    elif label == "unprotected":
-        print("!! THE DAEMON IS WATCHING NOTHING — no usable watch roots.")
-    elif label == "scan-failed":
-        print("!! EVERY CAPTURE IS FAILING (%s)." % state.get("scan_error", "reason not recorded"))
-    elif age > 300:
-        # Checked BEFORE `warning`, and the same way round in `health_verdict`:
-        # "the last capture was two days ago" supersedes a forecast about a
-        # daemon that may not be running at all.
-        print("!! STALE — the last capture was %ds ago; the daemon may not be running." % age)
-    elif label == "warning":
-        # Said in full, not softened. This is the one banner printed while
-        # everything still works, and it is the whole point of the state: an
-        # operator who reads "capture will stop" a week early can free space,
-        # and one who reads `ok` until the day it stops cannot.
-        print("!! CAPTURE WILL STOP (%s) — %s"
-              % (",".join(state.get("warning_reason") or ["reason not recorded"]),
-                 state.get("warning_detail", "no detail recorded")))
+    state, health = dhu_backup_announce.read_state(install_root, time.time())
+    line = health_banner_line(state, health)
+    if line is not None:
+        print(line)
+
+
+def health_banner_line(state, health):
+    """The banner for one heartbeat, or None for `ok`. PURE.
+
+    `state` is the parsed heartbeat (any shape, or None) and `health` is the
+    verdict `health_verdict` gave for it. `ok` has nothing to say, so the text
+    output of a healthy install is unchanged. A `warning` names its reasons
+    beside the detail, as `status` does, because the reasons are what the
+    operator acts on (`free-space-low` says which budget).
+    """
+    if health.verdict == "ok":
+        return None
+    sentence = dhu_backup_announce.health_sentence(health.verdict)
+    detail = health.detail
+    if health.verdict == "warning":
+        warning = _warning_status(state if isinstance(state, dict) else {}, health)
+        reasons = ",".join(warning["reasons"])
+        if reasons:
+            detail = "%s: %s" % (reasons, warning["detail"])
+    return "%s (%s)" % (sentence, detail)
 
 
 def health_object(install_root):
@@ -476,6 +479,11 @@ def _last_capture(state, now_epoch):
     try:
         epoch = int(raw)
     except (TypeError, ValueError):
+        return None
+    if not 0 <= epoch <= dhu_backup_core.MAX_HEARTBEAT_EPOCH:
+        # `health_verdict` has already called this heartbeat unreadable; the
+        # rendering must not overflow `time_t` and turn that verdict into a
+        # different one by way of the catch-all.
         return None
     return {"epoch": epoch, "iso": _iso(epoch * 1_000_000_000),
             "age_seconds": max(0, int(now_epoch) - epoch)}
@@ -786,25 +794,48 @@ def command_cat(args):
 
 
 def command_restore(args):
+    return restore_outcome(args)[0]
+
+
+def restore_outcome(args):
+    """`(code, kind)` for one restore, printing what the CLI prints.
+
+    `kind` names the outcome so a caller that cannot read the printed lines
+    (the MCP server) can still tell "the destination could not be written"
+    from "the store could not be read" from "restored". The CLI keeps the
+    code; the kind is the same fact for a machine.
+    """
     if _refuse_restore_as_root():
-        return 2
-    entry, code = _one_entry(args, args.path)
-    if entry is None:
-        return code
+        return 2, "refused"
+    entry, code, failure = _select_one(args, args.path)
+    if failure is not None:
+        _print_failure(failure, args.path)
+        return code, failure["kind"]
     version, code = _pick_version(entry, args)
     if version is None:
-        return code
+        return code, "bad-asof" if code == 2 else "no-version"
     return _restore_one(entry, version, args)
 
 
 def command_restore_dir(args):
-    """The incident's actual shape: a deleted directory back in one command."""
+    return restore_dir_outcome(args)[0]
+
+
+def restore_dir_outcome(args):
+    """The incident's actual shape: a deleted directory back in one command.
+
+    `(code, kind)`. A destination that cannot be written is a HARD failure of
+    the whole command (code 2, `destination-unwritable`), distinct from the
+    per-file "written beside a differing file" outcome that code 1 reports:
+    the first means nothing landed where it was asked to, the second that
+    everything did and some of it needs a look.
+    """
     if _refuse_restore_as_root():
-        return 2
+        return 2, "refused"
     entries, error = load_entries(args.install_root)
     if error:
         print("ERROR %s" % error)
-        return 2
+        return 2, "store-unavailable"
     prefix = args.directory.strip("/")
     matches = [
         e for e in entries
@@ -813,12 +844,13 @@ def command_restore_dir(args):
     ]
     if not matches:
         print("ERROR no readable versions under %r" % args.directory)
-        return 1
+        return 1, "no-match"
     at_epoch = _asof_epoch(args)
     if at_epoch is None and args.asof:
-        return 2
+        return 2, "bad-asof"
 
     restored = skipped = failed = 0
+    hard = []
     for entry in matches:
         if at_epoch is None:
             version = entry["versions"][-1]
@@ -830,14 +862,25 @@ def command_restore_dir(args):
             print("skip %s — no version at or before %s" % (entry["relpath"], args.asof))
             skipped += 1
             continue
-        code = _restore_one(entry, version, args)
+        code, kind = _restore_one(entry, version, args)
         if code == 0:
             restored += 1
         else:
             failed += 1
+            if code == 2:
+                hard.append(kind)
     print("restore-dir: %d restored, %d skipped, %d failed (of %d path(s))"
           % (restored, skipped, failed, len(matches)))
-    return 0 if failed == 0 else 1
+    if hard:
+        # The worst kind wins the label: an unwritable destination over a
+        # refused target over a store read failure, all of them code 2.
+        for kind in ("destination-unwritable", "refused-target", "store-unavailable"):
+            if kind in hard:
+                return 2, kind
+        return 2, hard[0]                                    # pragma: no cover
+    if failed:
+        return 1, "beside"
+    return 0, "ok"
 
 
 def _vault_commands(args, needle):
@@ -896,45 +939,96 @@ def command_status(args):
 
 
 def _restore_one(entry, version, args):
+    """`(code, kind)` for one file. Never raises for a destination it cannot
+    write: `--into` naming a regular file, a read-only volume or a directory
+    the caller may not write is reported as `ERROR could not write <dest>`
+    and code 2, `destination-unwritable`. The store was fine; saying
+    "store-unavailable" (which the MCP server's catch-all did) sent the
+    reader to the wrong side of the problem."""
     verdict = dhu_backup_core.restore_target(entry["relpath"], entry["watch_root"], args.into)
     if isinstance(verdict, Refuse):
         print("ERROR refusing to restore %s: %s" % (entry["relpath"], verdict.reason))
-        return 2
+        return 2, "refused-target"
     assert isinstance(verdict, Target)
     destination = verdict.path
 
-    with open(version["path"], "rb") as handle:
-        payload = handle.read()
+    try:
+        with open(version["path"], "rb") as handle:
+            payload = handle.read()
+    except (IOError, OSError) as exc:
+        print("ERROR could not read %s: %s" % (version["path"], _oserror_text(exc)))
+        return 2, "store-unavailable"
 
     if os.path.lexists(destination) and not args.overwrite:
         existing = _read_bytes(destination)
         if existing == payload:
             print("unchanged %s — the file already holds this version" % destination)
-            return 0
+            return 0, "unchanged"
         # Never silently clobber, and never silently refuse either: write beside
         # it and say exactly what happened.
         beside = "%s.restored-%s" % (destination, version["key"].lstrip("@"))
-        _write(beside, payload)
+        try:
+            _write(beside, payload)
+        except (IOError, OSError) as exc:
+            print("ERROR could not write %s: %s" % (beside, _oserror_text(exc)))
+            return 2, "destination-unwritable"
         print("EXISTS %s differs — wrote %s instead. Re-run with --overwrite to replace it."
               % (destination, beside))
         _log_restore(entry, version, beside, "beside")
-        return 1
+        return 1, "beside"
 
-    parent = os.path.dirname(destination)
-    if parent and not os.path.isdir(parent):
-        os.makedirs(parent, 0o755)
-    _write(destination, payload)
+    try:
+        parent = os.path.dirname(destination)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, 0o755)
+        _write(destination, payload)
+    except (IOError, OSError) as exc:
+        print("ERROR could not write %s: %s" % (destination, _oserror_text(exc)))
+        return 2, "destination-unwritable"
     print("restored %s (%d bytes, captured %s) -> %s"
           % (entry["relpath"], len(payload), _iso(version["epoch_ns"]), destination))
     _log_restore(entry, version, destination, "in-place")
-    return 0
+    return 0, "restored"
+
+
+def _oserror_text(exc):
+    """`strerror` plus the path the OS named, without the `[Errno N]` prefix."""
+    strerror = getattr(exc, "strerror", None) or type(exc).__name__
+    filename = getattr(exc, "filename", None)
+    return "%s: %s" % (strerror, filename) if filename else strerror
 
 
 def _write(path, payload):
-    temp = "%s.dhu-backup-restore.%d" % (path, os.getpid())
-    with open(temp, "wb") as handle:
-        handle.write(payload)
-    os.replace(temp, path)
+    """Write `payload` to `path` through a temp file in the same directory.
+
+    The temp file is created by `tempfile.mkstemp`: `O_CREAT|O_EXCL|O_NOFOLLOW`
+    under a name with a random suffix. The previous temp name was
+    `<path>.dhu-backup-restore.<pid>` opened with a plain `open(..., "wb")`,
+    which FOLLOWS a symlink planted at that predictable name — the payload
+    landed in the symlink's target and the destination became a link to it.
+    An agent that can plant the link can already write the target directly,
+    so this is hygiene rather than a privilege line; but a `restore-dir` of a
+    tree the agent tampered with must not follow every planted link without
+    saying so. With `O_EXCL` a planted name is an error, and the random suffix
+    means there is no name to plant. The mode is what `open` would have given:
+    0644 less the umask.
+    """
+    parent = os.path.dirname(path) or "."
+    fd, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".dhu-backup-restore.",
+                                dir=parent)
+    try:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.fchmod(fd, 0o644 & ~umask)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def _read_bytes(path):
@@ -1003,21 +1097,26 @@ def _one_entry(args, needle):
     entry, code, failure = _select_one(args, needle)
     if failure is None:
         return entry, code
+    _print_failure(failure, needle)
+    return None, code
+
+
+def _print_failure(failure, needle):
+    """The text a `_select_one` failure prints. One place, for every command."""
     if failure["kind"] == "store-unavailable":
         print("ERROR %s" % failure["error"])
-        return None, 2
+        return
     if failure["kind"] == "ambiguous":
         print("ERROR %s:" % failure["error"])
         for candidate in failure["candidates"]:
             print("    %s  [%s]" % (candidate["relpath"], candidate["root_id"]))
-        return None, 1
+        return
     print("ERROR %s" % failure["error"])
     if failure["kind"] == "vaulted":
         print("note: %r looks credential-class, so it is held in the root-only "
               "vault, not the readable store. Recover it with:" % needle)
         for command in failure["commands"]:
             print("      %s" % command)
-    return None, 1
 
 
 def _asof_epoch(args):

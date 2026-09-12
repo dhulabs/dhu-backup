@@ -24,10 +24,12 @@ three versions of the file it just lost are on disk and how to read them back.
 helper's `load_entries` walks the whole store — about 6,000 paths on this
 machine — to answer any question at all. Nothing here calls it. A file lookup is
 one `listdir` of that path's version-parent directory plus one `lstat` per
-version directory found; a not-held file costs two `stat`s and stops. The store
-layout is what makes that possible: a path's versions live at exactly
-`store/<root-id>/<slug>/<relpath-dir>/@<capture>-<sha>/<basename>`, so the
-directory to list is computable from the path alone.
+version directory found, plus — only when versions WERE found — one `listdir`
+of each matching version directory and of each directory component, to learn
+the spelling the store actually holds; a not-held file costs two `stat`s and
+stops. The store layout is what makes that possible: a path's versions live at
+exactly `store/<root-id>/<slug>/<relpath-dir>/@<capture>-<sha>/<basename>`, so
+the directory to list is computable from the path alone.
 
 **It must never raise.** A recovery hint that throws inside an error handler
 turns a recoverable ENOENT into a crash in the tool that was trying to help.
@@ -39,10 +41,13 @@ It holds no privilege the agent lacks (review C9): it reads a world-readable
 store as the caller, opens nothing else, and writes nothing at all.
 """
 
+import errno
 import json
 import os
+import stat
 import sys
 import time
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dhu_backup_core  # noqa: E402
@@ -62,6 +67,19 @@ MAX_VERSION_DIRS = 20000
 #: result reports "at least N". A deleted directory is the incident's shape, and
 #: an unbounded walk of a watch root on the hot path is not acceptable.
 MAX_HELD_PATHS = 10000
+
+#: errno values that mean "the store is readable and holds nothing here". The
+#: probe computes a directory from the caller's path and lists it; a path with
+#: no version directory is the normal not-held case.
+_NOT_HERE_ERRNOS = (errno.ENOENT, errno.ENOTDIR)
+
+#: errno values that mean the filesystem cannot NAME the caller's path at all —
+#: a component or the whole path longer than the limit, or a symlink loop. A
+#: path the filesystem cannot name cannot have been captured, because the
+#: daemon would have hit the same limit writing it. That is an answer
+#: (not-held, with the reason carried), never "store unavailable": reporting a
+#: healthy store as unreadable told an agent to distrust a correct empty answer.
+_UNNAMEABLE_ERRNOS = (errno.ENAMETOOLONG, errno.ELOOP)
 
 
 # ── the probe ─────────────────────────────────────────────────────────────────
@@ -205,9 +223,13 @@ def _probe_file(store, located, lookup):
     try:
         names = os.listdir(version_parent)
     except OSError as exc:
-        if getattr(exc, "errno", None) in (2, 20):   # ENOENT, ENOTDIR
+        code = getattr(exc, "errno", None)
+        if code in _NOT_HERE_ERRNOS:
             # No directory of versions for this path. That is an ANSWER — the
             # store is readable and holds nothing here — not a failure.
+            return None
+        if code in _UNNAMEABLE_ERRNOS:
+            lookup["not_held_reason"] = "unnameable-path: %s" % _errtext(exc, version_parent)
             return None
         return "store-unreadable: %s" % _errtext(exc, version_parent)
 
@@ -224,22 +246,109 @@ def _probe_file(store, located, lookup):
         keyed = keyed[:MAX_VERSION_DIRS]
         lookup["versions_capped"] = True
 
-    versions = []
+    # Versions grouped by the leaf name the store ACTUALLY holds. On a
+    # case-insensitive filesystem the `lstat` below succeeds for `readme.md`
+    # against a version of `README.md`, and the helper's selectors — which
+    # compare bytes — would then reject every command this result prints.
+    # Listing the one-entry version directory is what tells the two apart.
+    by_leaf = {}
     for name, (epoch_ns, sha) in keyed:
         full = os.path.join(version_parent, name, basename)
         try:
-            size = os.lstat(full).st_size
+            leaf_stat = os.lstat(full)
         except OSError:
             # This version directory belongs to a SIBLING file in the same
             # source directory — every file in one directory keeps its versions
             # as siblings here. Not an error, just not ours.
             continue
-        versions.append({"key": name, "epoch_ns": epoch_ns, "sha": sha,
-                         "size": size, "store_path": full,
-                         "iso": iso(epoch_ns)})
+        leaf = _stored_leaf(os.path.join(version_parent, name), basename, leaf_stat)
+        by_leaf.setdefault(leaf, []).append(
+            {"key": name, "epoch_ns": epoch_ns, "sha": sha,
+             "size": leaf_stat.st_size,
+             "store_path": os.path.join(version_parent, name, leaf),
+             "iso": iso(epoch_ns)})
+    if not by_leaf:
+        return None
+    if basename in by_leaf:
+        # An exact spelling wins outright: the given name IS a stored path.
+        leaf = basename
+    else:
+        # Every match was reached through the filesystem's case folding. Report
+        # the spelling with the newest version, which is the one to recover.
+        leaf = max(by_leaf, key=lambda name: max(v["key"] for v in by_leaf[name]))
+    versions = by_leaf[leaf]
     versions.sort(key=lambda v: (v["epoch_ns"], v["key"]))
     lookup["versions"] = versions
+    parts = [p for p in located.relpath.split("/") if p]
+    stored_dirs = _stored_dir_parts(store, located, parts[:-1])
+    store_relpath = "/".join(stored_dirs + [leaf])
+    if store_relpath != located.relpath:
+        lookup["store_relpath"] = store_relpath
     return None
+
+
+def _stored_leaf(version_dir, basename, basename_stat):
+    """The name the store holds for the file `basename` reached inside a
+    version directory. Equal to `basename` on a case-sensitive filesystem;
+    on a case-insensitive one it is whichever entry is the same inode."""
+    try:
+        names = os.listdir(version_dir)
+    except OSError:
+        return basename
+    if basename in names:
+        return basename
+    for name in names:
+        try:
+            if os.path.samestat(os.lstat(os.path.join(version_dir, name)), basename_stat):
+                return name
+        except OSError:
+            continue
+    return basename
+
+
+def _stored_dir_parts(store, located, parts):
+    """`parts` respelled as the store's directories are actually named.
+
+    Walks `store/<root-id>/<slug>/` one component at a time, listing each
+    parent, and keeps the caller's spelling for any component the listing
+    holds byte-for-byte. A component that is absent from the listing yet was
+    reached (the probe already succeeded through it) is looked up by inode
+    among its case-fold and Unicode-normalisation neighbours. Any error keeps
+    the caller's spelling: this is a courtesy, never a second verdict.
+    """
+    current = os.path.join(store, located.root_id, located.slug)
+    out = []
+    for part in parts:
+        try:
+            names = os.listdir(current)
+        except OSError:
+            out.append(part)
+            current = os.path.join(current, part)
+            continue
+        if part in names:
+            out.append(part)
+            current = os.path.join(current, part)
+            continue
+        found = part
+        try:
+            target = os.lstat(os.path.join(current, part))
+            folded = _fold(part)
+            for name in names:
+                if _fold(name) != folded:
+                    continue
+                if os.path.samestat(os.lstat(os.path.join(current, name)), target):
+                    found = name
+                    break
+        except OSError:
+            pass
+        out.append(found)
+        current = os.path.join(current, found)
+    return out
+
+
+def _fold(name):
+    """Case-folded, NFC-normalised — the equivalence APFS applies to names."""
+    return unicodedata.normalize("NFC", name).casefold()
 
 
 def _probe_directory(store, located, lookup):
@@ -247,10 +356,25 @@ def _probe_directory(store, located, lookup):
     parts = [p for p in located.relpath.split("/") if p] if located.relpath else []
     base = os.path.join(store, located.root_id, located.slug, *parts)
     try:
-        if not os.path.isdir(base):
+        base_stat = os.stat(base)
+    except OSError as exc:
+        # `os.path.isdir` would swallow every one of these as False, and False
+        # here means "not held" — which is the wrong answer for a directory
+        # that exists and cannot be read. Only the two "nothing here" errnos
+        # are that answer; an unnameable path is not-held with its reason.
+        code = getattr(exc, "errno", None)
+        if code in _NOT_HERE_ERRNOS:
             return None
-    except OSError as exc:                                  # pragma: no cover
+        if code in _UNNAMEABLE_ERRNOS:
+            lookup["not_held_reason"] = "unnameable-path: %s" % _errtext(exc, base)
+            return None
         return "store-unreadable: %s" % _errtext(exc, base)
+    if not stat.S_ISDIR(base_stat.st_mode):
+        return None
+    if parts:
+        stored = "/".join(_stored_dir_parts(store, located, parts))
+        if stored != located.relpath:
+            lookup["store_relpath"] = stored
 
     held = set()
     try:
@@ -349,6 +473,47 @@ def announce(abs_path, install_root=DEFAULT_INSTALL_ROOT, now=None):
 #: Watch roots printed before the list is elided with a count.
 _MAX_ROOTS_SHOWN = 6
 
+#: Characters a path may carry that a PROSE line must not: C0 and C1 controls
+#: (a newline forges a new "dhu-backup:" line; ESC starts a terminal escape),
+#: DEL, the Unicode line and paragraph separators, the zero-width characters
+#: that render as nothing, and the byte-order mark. Each is rendered as its
+#: escape rather than deleted, so the reader sees that it was there.
+_INVISIBLE = frozenset("\u2028\u2029\u200b\u200c\u200d\u200e\u200f\ufeff")
+
+#: Characters of a path echoed into prose before the rest is elided with a
+#: count. A 5,000-component path once produced a 20 KB hook context; the path
+#: had already reached the model once, as tool output, and the mirror's answer
+#: about it does not need to repeat it in full.
+DISPLAY_PATH_MAX = 512
+
+
+def display_path(text, limit=DISPLAY_PATH_MAX):
+    """A path as it may appear in a line of PROSE. PURE.
+
+    The commands this module prints are shell-quoted by `recovery_commands`
+    and are left alone; this is for the sentences around them, which echoed
+    the caller's path verbatim. For the hook that path is whatever text a
+    failed tool call carried — for Bash, tokens taken from the OUTPUT of
+    whatever the agent just ran — so a newline in it forged a fresh
+    "dhu-backup:" line in the model's context and an ESC sequence reached the
+    terminal untouched. Control and invisible characters become their escapes,
+    and anything past `limit` characters is replaced by a count.
+    """
+    if not isinstance(text, str):
+        text = repr(text)
+    out = []
+    for char in text:
+        code = ord(char)
+        if code < 0x20 or code == 0x7f or 0x80 <= code <= 0x9f or char in _INVISIBLE \
+                or 0xd800 <= code <= 0xdfff:
+            out.append("\\x%02x" % code if code < 0x100 else "\\u%04x" % code)
+        else:
+            out.append(char)
+    rendered = "".join(out)
+    if len(rendered) > limit:
+        rendered = "%s [... %d more characters]" % (rendered[:limit], len(rendered) - limit)
+    return rendered
+
 _HEALTH_NOTE = {
     # Present tense for a thing that has not happened yet, and no hedging: the
     # store is still growing, which is exactly why there is time to act.
@@ -394,7 +559,12 @@ def health_sentence(verdict):
 
 
 def format_text(result):
-    """A few lines an agent reads. Never raises."""
+    """A few lines an agent reads. Never raises.
+
+    Every path-derived value in a PROSE line goes through `display_path`; the
+    command lines are `recovery_commands`' own, shell-quoted, and untouched.
+    """
+    show = display_path
     lines = []
     note = _HEALTH_NOTE.get(result.health)
     if note:
@@ -404,32 +574,38 @@ def format_text(result):
         newest = result.newest or {}
         lines.append("dhu-backup: HELD — %s%d version(s) of %s"
                      % ("at least " if result.versions_capped else "",
-                        len(result.versions), result.relpath))
-        lines.append("  origin  %s" % result.origin)
+                        len(result.versions), show(result.relpath)))
+        lines.append("  origin  %s" % show(result.origin))
         lines.append("  newest  %s  (%s bytes, sha %s)"
                      % (newest.get("iso", "?"), newest.get("size", "?"), newest.get("sha", "?")))
+        if result.reason:
+            lines.append("  note    %s" % show(result.reason))
     elif result.status == "held-directory":
         lines.append("dhu-backup: HELD (directory) — the store holds %s%d path(s) under %s"
                      % ("at least " if result.held_path_count_capped else "",
-                        result.held_path_count, result.origin))
+                        result.held_path_count, show(result.origin)))
+        if result.reason:
+            lines.append("  note    %s" % show(result.reason))
     elif result.status == "vaulted":
         lines.append("dhu-backup: VAULTED — %s is credential-class (%s), so if it was "
                      "captured it is in the root-only vault, which is unreadable "
-                     "without sudo." % (result.relpath, result.reason))
+                     "without sudo." % (show(result.relpath), show(result.reason)))
         lines.append("  This tool cannot see the vault and does not claim the file is "
                      "there. Look with sudo:")
     elif result.status == "not-held":
         lines.append("dhu-backup: NOT HELD — %s is inside the watch root %s, the store "
                      "was read, and it holds no version of that path."
-                     % (result.relpath, result.watch_root))
+                     % (show(result.relpath), show(result.watch_root)))
+        if result.reason:
+            lines.append("  reason  %s" % show(result.reason))
     elif result.status == "outside-watch-roots":
         lines.append("dhu-backup: NOT PROTECTED — %s (%s), so it was never captured."
-                     % (result.path, result.reason))
+                     % (show(result.path), show(result.reason)))
         if result.watch_roots:
             # 30 watch roots on one line is not readable, and the point of the
             # line is "here is the shape of what IS protected", not a manifest.
             # The count is always stated so the elision is never silent.
-            shown = list(result.watch_roots[:_MAX_ROOTS_SHOWN])
+            shown = [show(root) for root in result.watch_roots[:_MAX_ROOTS_SHOWN]]
             more = len(result.watch_roots) - len(shown)
             lines.append("  %d watch root(s): %s%s"
                          % (len(result.watch_roots), ", ".join(shown),
@@ -438,7 +614,7 @@ def format_text(result):
             lines.append("  no watch roots are configured.")
     elif result.status == "store-unavailable":
         lines.append("dhu-backup: STORE UNAVAILABLE — could not determine whether %s is "
-                     "held: %s" % (result.path, result.reason))
+                     "held: %s" % (show(result.path), show(result.reason)))
         lines.append("  This is NOT the same as 'no versions'. Do not treat it as one.")
     else:                                                    # pragma: no cover
         lines.append("dhu-backup: %s" % result.status)
