@@ -62,7 +62,7 @@ curl -sL https://github.com/dhulabs/dhu-backup/archive/refs/tags/v0.3.0.tar.gz |
   shasum -a 256
 ```
 
-Paste that hex string over `REPLACE_ME_WITH_THE_SHA256_OF_THE_v0.3.0_TARBALL`.
+Compare that hex string with the `sha256` line already in the formula; for a new tag, paste the new one over it.
 
 ## Updating for a new release
 

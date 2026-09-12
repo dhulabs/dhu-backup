@@ -16,12 +16,11 @@ class DhuBackup < Formula
   desc "Append-only mirror of the files a coding agent can delete, written by a root daemon"
   homepage "https://github.com/dhulabs/dhu-backup"
   url "https://github.com/dhulabs/dhu-backup/archive/refs/tags/v0.3.0.tar.gz"
-  # PLACEHOLDER — replace with the sha256 of the published v0.3.0 tarball:
+  # The sha256 of the published v0.3.0 tarball, computed twice from
   #   curl -sL https://github.com/dhulabs/dhu-backup/archive/refs/tags/v0.3.0.tar.gz | shasum -a 256
-  # Left as a placeholder rather than a guess: a wrong checksum here fails the
-  # install loudly, and an invented one that happened to be right would mean
-  # nobody ever checked what was published.
-  sha256 "REPLACE_ME_WITH_THE_SHA256_OF_THE_v0.3.0_TARBALL"
+  # on 2026-09-12 after the release was cut. A wrong checksum here fails the
+  # install loudly; re-run that command against any new tag before bumping.
+  sha256 "45c234006aaa2bf3b8d01a776011b94f701c04fc51a78366f9b0ff67c81cb6b3"
   license "Apache-2.0"
 
   # No `depends_on "python"`. The daemon and the helpers run under the SYSTEM
